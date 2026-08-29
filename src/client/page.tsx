@@ -388,6 +388,10 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         )),
       React.createElement('div', { className: 'phub-actions' },
         React.createElement('button', { className: 'phub-btn', onClick: addGateway }, `+ ${t('addGateway')}`),
+        // Surface operation outcomes (success/failure) even before any
+        // gateway is selected; otherwise a failed call looks like a dead
+        // button (the editor status line only renders when selected != null).
+        status === null ? null : React.createElement('span', { className: `phub-status ${status.kind}` }, status.text),
       ),
     ),
     // ---- Per-gateway editor ----
