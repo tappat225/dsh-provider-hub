@@ -53,6 +53,8 @@ export interface ProviderHubRuntimeDeps {
   resolveApiKey(gw: GatewayConfig): Promise<string>;
   /** Gateway config by provider route. */
   gatewayFor(provider: string): GatewayConfig | undefined;
+  /** Diagnostic sink (logger.info) for the settings write/read chain. */
+  log(message: string): void;
 }
 
 /** Settings mutate op shape (schemastery settings service). */
@@ -94,6 +96,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
   async getState(): Promise<Envelope> {
     try {
       const config = this.deps.current();
+      this.deps.log(`getState: current() gateways=${config.gateways.length} ${JSON.stringify(config.gateways.map((gw) => gw.provider))}`);
       return ok({
         config,
         gateways: config.gateways.map((gw, index) => ({
@@ -116,6 +119,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
       if (st === undefined) return fail('settings service unavailable');
       if (st.writable === false) return fail('settings are read-only');
       const config = this.deps.current();
+      this.deps.log(`addGateway: before mutate current() gateways=${config.gateways.length}`);
       const used = new Set(config.gateways.map((gw) => gw.provider));
       let base = 'hub-gateway';
       let provider = base;
@@ -138,6 +142,8 @@ export class ProviderHubRuntime extends TypertRemoteService {
       const ops: Op[] = [{ op: 'set', path: ['gateways'], value: [...config.gateways, gw] }];
       const index = config.gateways.length;
       await st.mutate('llm-provider-hub', ops);
+      const after = this.deps.current();
+      this.deps.log(`addGateway: after mutate current() gateways=${after.gateways.length} ${JSON.stringify(after.gateways.map((g) => g.provider))}`);
       return ok({ index, gateway: gw });
     } catch (error) {
       return fail(error);

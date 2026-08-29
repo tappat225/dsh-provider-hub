@@ -323,6 +323,7 @@ const runtime = new ProviderHubRuntime(
     current: () => stored,
     resolveApiKey: async () => 'sk-test',
     gatewayFor: (p) => stored.gateways.find((g) => g.provider === p),
+    log: () => {},
   },
 );
 const st = await runtime.getState();
