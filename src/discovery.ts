@@ -48,10 +48,11 @@ export async function discoverModels(
     supplied = undefined; // probe unauthenticated when no key resolves
   }
   const headers: Record<string, string> = {
+    ...(gw.extraHeaders ?? {}),
     accept: 'application/json',
     'user-agent': gw.userAgent,
   };
-  if (supplied !== undefined) headers.authorization = `Bearer ${supplied}`;
+  if (supplied !== undefined && supplied !== '') headers.authorization = `Bearer ${supplied}`;
   let response: Response;
   try {
     response = await fetch(url, {

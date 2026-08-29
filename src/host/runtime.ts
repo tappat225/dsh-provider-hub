@@ -283,7 +283,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
     }
   }
 
-  /** Set or clear the presetFrom import on one gateway. */
+  /** Discover models with the saved gateway configuration. */
   async discover(index: number): Promise<Envelope> {
     try {
       const gw = this.gatewayAt(index);
@@ -292,6 +292,75 @@ export class ProviderHubRuntime extends TypertRemoteService {
       return ok({ models });
     } catch (error) {
       return fail(error);
+    }
+  }
+
+  /**
+   * Test an unsaved gateway draft against GET {baseURL}/models. This is kept
+   * separate from discover(): the settings page can verify a freshly typed
+   * URL/key/UA/header combination without persisting it first. The FULL model
+   * listing rides along in the envelope so the client can seed its discovery
+   * list without a second round-trip.
+   */
+  async testConnection(index: number, draft: Record<string, unknown>): Promise<Envelope> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const saved = this.gatewayAt(index);
+      if (saved === undefined) return fail('gateway index out of range');
+      // The draft crosses the typert boundary as a plain object: merge it over
+      // the saved gateway field by field, keeping every field type-safe
+      // (an ill-typed draft falls back to the saved value instead of
+      // corrupting the probe).
+      const str = (v: unknown, fallback: string): string => (typeof v === 'string' ? v : fallback);
+      const api = draft.api;
+      const headers: unknown = draft.extraHeaders === undefined ? saved.extraHeaders : draft.extraHeaders;
+      if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) {
+        return fail('extraHeaders must be a JSON object');
+      }
+      for (const [name, value] of Object.entries(headers)) {
+        if (typeof value !== 'string') return fail(`extraHeaders.${name} must be a string`);
+      }
+      const testGateway: GatewayConfig = {
+        ...saved,
+        provider: str(draft.provider, saved.provider),
+        displayName: str(draft.displayName, saved.displayName),
+        baseURL: str(draft.baseURL, saved.baseURL ?? ''),
+        api: api === 'openai-completions' || api === 'anthropic-messages' ? api : saved.api,
+        userAgent: str(draft.userAgent, saved.userAgent),
+        apiKey: str(draft.apiKey, saved.apiKey),
+        apiKeyEnv: str(draft.apiKeyEnv, saved.apiKeyEnv),
+        anthropicThinking: typeof draft.anthropicThinking === 'boolean' ? draft.anthropicThinking : saved.anthropicThinking,
+        extraHeaders: headers as Record<string, string>,
+      };
+      // str() guarantees a string, but the GatewayConfig annotation widens the
+      // field back to `string | undefined`.
+      const baseURL = (testGateway.baseURL ?? '').trim();
+      if (baseURL === '') return fail('Base URL is required');
+      let parsed: URL;
+      try {
+        parsed = new URL(baseURL);
+      } catch {
+        return fail('Base URL is not a valid URL');
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return fail('Base URL must use http or https');
+      const started = Date.now();
+      const models = await discoverModels(
+        { baseURL, signal: controller.signal },
+        testGateway,
+        () => this.deps.resolveApiKey(testGateway),
+      );
+      return ok({
+        endpoint: `${baseURL.replace(/\/+$/, '')}/models`,
+        latencyMs: Date.now() - started,
+        modelCount: models.length,
+        models,
+      });
+    } catch (error) {
+      if (controller.signal.aborted) return fail('Connection timed out after 15 seconds');
+      return fail(error);
+    } finally {
+      clearTimeout(timeout);
     }
   }
 

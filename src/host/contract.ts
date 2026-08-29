@@ -90,6 +90,7 @@ export const METHODS = {
   upsertCustom: 'upsert-custom',
   deleteCustom: 'delete-custom',
   discover: 'discover',
+  testConnection: 'test-connection',
   enableDiscovered: 'enable-discovered',
 } as const;
 
@@ -113,6 +114,7 @@ export const INVOCATIONS = [
   invocation('upsertCustom', 'upsertCustom', [numberParam('index'), objectParam('entry'), nullishObjectParam('originalId')]),
   invocation('deleteCustom', 'deleteCustom', [numberParam('index'), stringParam('id')]),
   invocation('discover', 'discover', [numberParam('index')]),
+  invocation('testConnection', 'testConnection', [numberParam('index'), objectParam('draft')]),
   invocation('enableDiscovered', 'enableDiscovered', [numberParam('index'), objectParam('model')]),
 ];
 
@@ -126,7 +128,7 @@ export const TYPERT_MANIFEST = {
       {
         key: 'providerHub',
         exportName: 'ProviderHubRuntime',
-        description: 'Manage the provider-hub gateways and their model catalogs: read/write the llm-provider-hub settings section, add/remove gateways, toggle built-in catalog models, edit overrides and custom models, import presets, and discover models from each gateway.',
+        description: 'Manage provider-hub gateways and model catalogs: read/write settings, add/remove routes, test draft credentials, edit models, and discover upstream models.',
         tags: [],
         members: [
           { kind: 'method', name: 'getState', signature: 'getState(): Promise<object>' },
@@ -138,6 +140,7 @@ export const TYPERT_MANIFEST = {
           { kind: 'method', name: 'upsertCustom', signature: 'upsertCustom(index: number, entry: object, originalId: object | null): Promise<object>' },
           { kind: 'method', name: 'deleteCustom', signature: 'deleteCustom(index: number, id: string): Promise<object>' },
           { kind: 'method', name: 'discover', signature: 'discover(index: number): Promise<object>' },
+          { kind: 'method', name: 'testConnection', signature: 'testConnection(index: number, draft: object): Promise<object>' },
           { kind: 'method', name: 'enableDiscovered', signature: 'enableDiscovered(index: number, model: object): Promise<object>' },
         ],
         types: [],

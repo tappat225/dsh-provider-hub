@@ -333,6 +333,21 @@ const dg = await runtime.deleteGateway(1);
 check('runtime deleteGateway', dg.ok === true && stored.gateways.length === 1, JSON.stringify({ gateways: stored.gateways.length }));
 const rd = await runtime.discover(0);
 check('runtime discover via echo', rd.ok === true && rd.models.length === 2 && rd.models[0].id === 'glm-5.3', JSON.stringify(rd.models));
+
+// 9a. testConnection: probe an UNSAVED draft (URL/key/headers) against /models.
+// The full listing rides along so the settings page can seed its discovery
+// list without a second fetch; trailing slashes normalize away.
+const tc = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996/', apiKey: 'sk-draft', extraHeaders: {} });
+check('runtime testConnection ok (draft, trailing slash)', tc.ok === true && tc.modelCount === 2 && tc.models.length === 2 && typeof tc.latencyMs === 'number' && tc.endpoint === 'http://127.0.0.1:18996/models', JSON.stringify(tc));
+// A draft apiKey merges over the saved one (empty literal -> env fallback).
+const tcKey = await runtime.testConnection(0, { apiKey: '' });
+check('runtime testConnection: empty draft apiKey falls back (env path)', tcKey.ok === true, String(tcKey.error));
+const tcBadUrl = await runtime.testConnection(0, { baseURL: '://nope' });
+check('runtime testConnection rejects invalid URL', tcBadUrl.ok === false && /valid URL/.test(String(tcBadUrl.error)), String(tcBadUrl.error));
+const tcBadHeaders = await runtime.testConnection(0, { extraHeaders: { 'x-a': 1 } });
+check('runtime testConnection rejects non-string header value', tcBadHeaders.ok === false && /extraHeaders/.test(String(tcBadHeaders.error)), String(tcBadHeaders.error));
+const tcDead = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:1/' });
+check('runtime testConnection unreachable endpoint fails', tcDead.ok === false && /could not reach/.test(String(tcDead.error)), String(tcDead.error));
 const ro = await runtime.saveOverrides(0, { 'glm-5.3': { contextWindow: 999999 } });
 check('runtime saveOverrides', ro.ok === true && stored.gateways[0].modelOverrides['glm-5.3'].contextWindow === 999999);
 

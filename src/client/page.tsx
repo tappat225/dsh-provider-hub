@@ -35,7 +35,6 @@ interface GatewayEntry {
   index: number;
   gateway: Record<string, unknown>;
   models: Array<Record<string, unknown>>;
-  preset: Record<string, unknown> | null;
 }
 
 interface State {
@@ -49,6 +48,16 @@ interface DiscoveredModel {
   name?: string;
   contextWindow?: number;
   maxTokens?: number;
+}
+
+/** One connection-test outcome, keyed by gateway index (null = cleared). */
+interface TestResult {
+  ok: boolean;
+  endpoint?: string;
+  latencyMs?: number;
+  modelCount?: number;
+  models?: DiscoveredModel[];
+  error?: string;
 }
 
 // ---- Small presentational helpers (DSH settings recipe) ----
@@ -98,6 +107,18 @@ function SwitchUI(props: { checked: boolean; onChange: (next: boolean) => void; 
 function ChipUI(props: { text: string }): ReactTypes.ReactElement {
   const ch = (props.text || '?').charAt(0);
   return React.createElement('span', { className: 'phub-icon-chip' }, ch);
+}
+
+/**
+ * Sub-section heading inside a group card (12px secondary title + tertiary
+ * hint): gives the models card a stable reading order — enabled / discover /
+ * add / overrides — instead of one undifferentiated stack of rows.
+ */
+function SubHead(title: string, hint?: string): ReactTypes.ReactElement {
+  return React.createElement('div', { className: 'phub-subhead' },
+    React.createElement('span', { className: 'phub-subhead-title' }, title),
+    hint === undefined ? null : React.createElement('span', { className: 'phub-subhead-hint' }, hint),
+  );
 }
 
 interface SelectMenuOption {
@@ -153,9 +174,13 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   const [busy, setBusy] = React.useState(false);
   const [addModelDraft, setAddModelDraft] = React.useState<{ id: string; name: string; contextWindow: string; maxTokens: string }>(
     { id: '', name: '', contextWindow: '', maxTokens: '' });
+  const [presetPick, setPresetPick] = React.useState('');
   const [overridesText, setOverridesText] = React.useState<Record<number, string>>({});
   const [headersText, setHeadersText] = React.useState<Record<number, string>>({});
   const [discovered, setDiscovered] = React.useState<Record<number, DiscoveredModel[] | null>>({});
+  const [testing, setTesting] = React.useState(false);
+  const [discovering, setDiscovering] = React.useState(false);
+  const [testResult, setTestResult] = React.useState<Record<number, TestResult | null>>({});
 
   const refresh = React.useCallback(async () => {
     try {
@@ -227,6 +252,84 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       ...s,
       gateways: s.gateways.map((g) => (g.index === selected ? { ...g, gateway: { ...g.gateway, [key]: value } } : g)),
     }));
+    // Any edit invalidates the last connection test (it probed other values).
+    setTestResult((tr) => (tr[selected] === undefined || tr[selected] === null ? tr : { ...tr, [selected]: null }));
+  };
+
+  /** Clear the connection-test banner for the selected gateway. */
+  const clearTestResult = () => {
+    const selected = state.selected;
+    if (selected === null) return;
+    setTestResult((tr) => (tr[selected] === undefined || tr[selected] === null ? tr : { ...tr, [selected]: null }));
+  };
+
+  /**
+   * Current form values as a gateway draft for connection probing (the Test
+   * button and the model fetch both use it, so UNSAVED edits are reflected
+   * immediately). Returns null when the extra-headers JSON cannot be parsed.
+   */
+  const buildDraft = (): Record<string, unknown> | null => {
+    const selected = state.selected;
+    if (selected === null) return null;
+    const entry = state.gateways.find((g) => g.index === selected);
+    if (entry === undefined) return null;
+    const cfg = entry.gateway;
+    const draft: Record<string, unknown> = {
+      provider: cfg.provider,
+      displayName: cfg.displayName,
+      baseURL: cfg.baseURL,
+      api: cfg.api,
+      userAgent: cfg.userAgent,
+      apiKey: cfg.apiKey,
+      apiKeyEnv: cfg.apiKeyEnv,
+      anthropicThinking: Boolean(cfg.anthropicThinking),
+      extraHeaders: {},
+    };
+    const raw = (headersText[selected] ?? '').trim();
+    if (raw !== '') {
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+        draft.extraHeaders = parsed;
+      } catch {
+        return null;
+      }
+    }
+    return draft;
+  };
+
+  /** Adopt a test-connection envelope: banner + (on success) seed the discovery list. */
+  const applyTestResult = (index: number, r: Record<string, unknown> & { ok: boolean }): void => {
+    if (!r.ok) {
+      setTestResult((tr) => ({ ...tr, [index]: { ok: false, error: String((r as { error?: unknown }).error ?? '') } }));
+      return;
+    }
+    const res = r as unknown as { endpoint: string; latencyMs: number; modelCount: number; models?: DiscoveredModel[] };
+    const models = Array.isArray(res.models) ? res.models : [];
+    setTestResult((tr) => ({ ...tr, [index]: { ok: true, endpoint: res.endpoint, latencyMs: res.latencyMs, modelCount: res.modelCount, models } }));
+    // The probe already fetched the listing: reuse it so models can be
+    // enabled without a second round-trip.
+    setDiscovered((d) => ({ ...d, [index]: models }));
+  };
+
+  /** Probe GET {baseURL}/models with the CURRENT form values (no save needed). */
+  const runTest = () => {
+    const selected = state.selected;
+    if (selected === null) return;
+    const draft = buildDraft();
+    if (draft === null) {
+      setTestResult((tr) => ({ ...tr, [selected]: { ok: false, error: 'extraHeaders: invalid JSON' } }));
+      return;
+    }
+    void (async () => {
+      setTesting(true);
+      try {
+        const r = await call('test-connection', { index: selected, draft });
+        applyTestResult(selected, r);
+      } finally {
+        setTesting(false);
+      }
+    })();
   };
 
   const addGateway = () => {
@@ -256,16 +359,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         void refresh();
         setState((s) => ({ ...s, selected: null }));
       }
-    })();
-  };
-
-  const toggleBuiltin = (id: string, enabled: boolean) => {
-    const selected = state.selected;
-    if (selected === null) return;
-    void (async () => {
-      const r = await call('toggle-builtin', { index: selected, id, enabled });
-      if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-      else void refresh();
     })();
   };
 
@@ -310,6 +403,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       else {
         setStatus({ kind: 'ok', text: `${id} ${t('enable')} ✓` });
         setAddModelDraft({ id: '', name: '', contextWindow: '', maxTokens: '' });
+        setPresetPick('');
         void refresh();
       }
     })();
@@ -331,22 +425,37 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     })();
   };
 
-  const runDiscover = async () => {
+  /**
+   * Fetch the upstream model listing with the CURRENT form values (the same
+   * draft the Test button probes — unsaved URL/key edits are included), then
+   * show the list for one-click enabling. Falls back to an error status when
+   * the extra-headers JSON is invalid.
+   */
+  const runFetchModels = () => {
     const selected = state.selected;
     if (selected === null) return;
-    setDiscovered((d) => ({ ...d, [selected]: null }));
-    setBusy(true);
-    try {
-      const r = await call('discover', { index: selected });
-      if (!r.ok) {
-        setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-        return;
-      }
-      setDiscovered((d) => ({ ...d, [selected]: (r as unknown as { models: DiscoveredModel[] }).models }));
-      setStatus({ kind: 'ok', text: t('discovered') });
-    } finally {
-      setBusy(false);
+    const draft = buildDraft();
+    if (draft === null) {
+      setStatus({ kind: 'err', text: 'extraHeaders: invalid JSON' });
+      return;
     }
+    void (async () => {
+      setDiscovering(true);
+      setDiscovered((d) => ({ ...d, [selected]: null }));
+      try {
+        const r = await call('test-connection', { index: selected, draft });
+        if (!r.ok) {
+          setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
+          return;
+        }
+        const modelsRaw = (r as { models?: unknown }).models;
+        const models = Array.isArray(modelsRaw) ? modelsRaw as DiscoveredModel[] : [];
+        setDiscovered((d) => ({ ...d, [selected]: models }));
+        setStatus({ kind: 'ok', text: t('discovered') });
+      } finally {
+        setDiscovering(false);
+      }
+    })();
   };
 
   const enableDiscovered = async (model: DiscoveredModel) => {
@@ -382,6 +491,25 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   const cfg = selectedEntry?.gateway ?? {};
   const statusLine = status === null ? null
     : React.createElement('span', { className: `phub-status phub-status-${status.kind}` }, status.text);
+  // Connection-test banner for the selected gateway (null until first test;
+  // cleared on any field edit so it can never describe stale values).
+  const test = selected === null ? null : testResult[selected] ?? null;
+  const testModels = test?.models ?? [];
+  const testBanner = test === null ? null : React.createElement('div', {
+    className: `phub-test-result ${test.ok ? 'phub-test-ok' : 'phub-test-err'}`,
+  },
+    React.createElement('span', null, test.ok
+      ? `✓ ${t('testOk')} · ${String(test.latencyMs ?? 0)}ms · ${String(test.modelCount ?? 0)} ${t('testModels')}${testModels.length > 0 ? ` · ${t('testSeeded')}` : ''}`
+      : `✕ ${t('testFailed')}`),
+    React.createElement('span', { className: 'phub-test-detail' },
+      test.ok
+        ? `GET ${String(test.endpoint ?? '')}${testModels.length > 0
+            ? ` → ${testModels.slice(0, 3).map((m) => m.id).join(', ')}${testModels.length > 3 ? ' …' : ''}`
+            : ''}`
+        : String(test.error ?? '')),
+  );
+  // Model ids already enabled on the selected gateway (marks discovered rows).
+  const enabledIds = new Set((selectedEntry?.models ?? []).map((m) => String(m.id)));
 
   return React.createElement('div', { className: 'phub-page' },
     React.createElement('p', { className: 'phub-intro' }, t('intro')),
@@ -463,23 +591,35 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
             onChange: (next) => setField('anthropicThinking', next),
           }),
         }),
-        Row({
-          title: `${t('extraHeaders')} (JSON)`,
-          control: React.createElement('textarea', {
+        // JSON editors get the full card width: a narrow right-hand box
+        // makes JSON unreadable.
+        React.createElement('div', { className: 'phub-stack' },
+          React.createElement('span', { className: 'phub-stack-label' }, `${t('extraHeaders')} (JSON)`),
+          React.createElement('textarea', {
             className: 'phub-textarea',
-            style: { width: 320 },
             value: headersText[selected] ?? '',
-            onChange: (e: ReactTypes.ChangeEvent<HTMLTextAreaElement>) => setHeadersText((h) => ({ ...h, [selected]: e.target.value })),
+            onChange: (e: ReactTypes.ChangeEvent<HTMLTextAreaElement>) => {
+              setHeadersText((h) => ({ ...h, [selected]: e.target.value }));
+              clearTestResult();
+            },
           }),
-        }),
+        ),
         React.createElement('div', { className: 'phub-actions' },
           React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void save() }, t('save')),
+          // Probe GET {baseURL}/models with the form values — no save needed.
+          React.createElement('button', {
+            className: 'phub-btn',
+            disabled: busy || testing || String(cfg.baseURL ?? '').trim() === '',
+            onClick: runTest,
+          }, testing ? `${t('testConnection')}…` : t('testConnection')),
           statusLine,
         ),
+        testBanner,
       ),
     ),
 
     // ---- Models ----
+    // Stable reading order: enabled list → discover → add → overrides.
     selected === null || selectedEntry === undefined ? null : React.createElement('section', null,
       React.createElement('div', { className: 'phub-group-heading' },
         t('models'),
@@ -488,11 +628,11 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         ),
       ),
       React.createElement('div', { className: 'phub-group' },
-        // Enabled model list: catalog entries + custom models, each removable.
-        React.createElement('div', { className: 'phub-editor-note', style: { paddingTop: 10 } }, t('modelsEnabled')),
-        React.createElement('div', { className: 'phub-models-list', style: { marginTop: 4 } },
+        // -- Enabled models (catalog entries + custom models), each removable.
+        SubHead(t('modelsEnabled')),
+        React.createElement('div', { className: 'phub-models-list' },
           (selectedEntry.models ?? []).length === 0
-            ? React.createElement('span', { className: 'phub-editor-note', style: { padding: '6px 8px' } }, `${t('empty')} — ${t('addModelHint')}`)
+            ? React.createElement('span', { className: 'phub-editor-note', style: { padding: '2px 8px 6px' } }, t('modelsEmptyHint'))
             : (selectedEntry.models ?? []).map((m) => {
               const id = String(m.id ?? '');
               const name = String(m.name ?? id);
@@ -513,27 +653,37 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
               });
             }),
         ),
-        React.createElement('div', { className: 'phub-actions' },
-          React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void runDiscover() }, t('discover')),
-          React.createElement('span', { className: 'phub-editor-note' }, t('discoverHint')),
+        // -- Discover: pull the upstream listing (with the current form
+        //    values) and enable models in one click.
+        SubHead(t('discover'), t('discoverHint')),
+        React.createElement('div', { className: 'phub-actions', style: { paddingTop: 0 } },
+          React.createElement('button', {
+            className: 'phub-btn',
+            disabled: discovering || String(cfg.baseURL ?? '').trim() === '',
+            onClick: runFetchModels,
+          }, discovering ? `${t('discoverRun')}…` : t('discoverRun')),
         ),
         discovered[selected] === null || discovered[selected] === undefined ? null
           : React.createElement('div', { className: 'phub-discover-list' },
-            (discovered[selected] ?? []).map((model) => React.createElement('div', { className: 'phub-discover-item', key: model.id },
-              React.createElement('span', null,
-                `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}`,
-              ),
-              React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
-            )),
+            (discovered[selected] ?? []).length === 0
+              ? React.createElement('span', { className: 'phub-editor-note', style: { padding: '4px 0' } }, `${t('discovered')}: ${t('empty')}`)
+              : (discovered[selected] ?? []).map((model) => React.createElement('div', { className: 'phub-discover-item', key: model.id },
+                React.createElement('span', null,
+                  `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}`,
+                ),
+                enabledIds.has(model.id)
+                  ? React.createElement('span', { className: 'phub-mark' }, t('alreadyEnabled'))
+                  : React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
+              )),
           ),
-        // Built-in preset models: pick one of our curated catalog entries —
-        // the add form fills the id/params for you (params apply on enable).
-        React.createElement('div', { className: 'phub-editor-note', style: { paddingTop: 10 } }, t('builtinPresetHint')),
+        // -- Add: built-in preset dropdown fills the manual form below.
+        SubHead(t('addModel'), t('addModelHint')),
         Row({
           title: t('builtinPreset'),
+          desc: t('presetHint'),
           control: React.createElement(SelectMenu, {
             label: t('builtinPreset'),
-            value: '',
+            value: presetPick,
             options: [
               { value: '', title: '—' },
               ...Object.entries(state.catalog).sort(([a], [b]) => a.localeCompare(b)).map(([id, entry]) => ({
@@ -542,6 +692,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
               })),
             ],
             onChange: (next) => {
+              setPresetPick(next);
               const entry = next === '' ? undefined : state.catalog[next];
               setAddModelDraft({
                 id: next,
@@ -551,11 +702,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
               });
             },
           }),
-        }),
-        // Add-model row: catalog ids auto-fill params, others become custom.
-        Row({
-          title: t('addModel'),
-          desc: t('addModelHint'),
         }),
         React.createElement('div', { className: 'phub-custom-item' },
           React.createElement('input', {
@@ -584,32 +730,18 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
           }),
           React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: submitAddModel }, t('addCustom')),
         ),
-        Row({
-          title: `${t('overrides')} (JSON)`,
-          desc: t('overridesHint'),
-          control: React.createElement('textarea', {
+        // -- Overrides: full-width JSON editor + save.
+        SubHead(t('overrides'), t('overridesHint')),
+        React.createElement('div', { className: 'phub-stack' },
+          React.createElement('textarea', {
             className: 'phub-textarea',
-            style: { width: 320 },
             value: overridesText[selected] ?? '',
             onChange: (e: ReactTypes.ChangeEvent<HTMLTextAreaElement>) => setOverridesText((o) => ({ ...o, [selected]: e.target.value })),
           }),
-        }),
-        React.createElement('div', { className: 'phub-actions' },
-          React.createElement('button', { className: 'phub-btn', onClick: saveOverrides }, `${t('overrides')}: ${t('save')}`),
-        ),
-        React.createElement('div', { className: 'phub-actions' },
-          React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void runDiscover() }, t('discover')),
-          React.createElement('span', { className: 'phub-editor-note' }, t('discoverHint')),
-        ),
-        discovered[selected] === null || discovered[selected] === undefined ? null
-          : React.createElement('div', { className: 'phub-discover-list' },
-            (discovered[selected] ?? []).map((model) => React.createElement('div', { className: 'phub-discover-item', key: model.id },
-              React.createElement('span', null,
-                `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}`,
-              ),
-              React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
-            )),
+          React.createElement('div', { className: 'phub-stack-foot' },
+            React.createElement('button', { className: 'phub-btn', onClick: saveOverrides }, t('save')),
           ),
+        ),
       ),
     ),
   );

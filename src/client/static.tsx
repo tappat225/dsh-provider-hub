@@ -44,6 +44,7 @@ const METHOD_MAP: Record<string, string> = {
   'upsert-custom': 'upsertCustom',
   'delete-custom': 'deleteCustom',
   'discover': 'discover',
+  'test-connection': 'testConnection',
   'enable-discovered': 'enableDiscovered',
 };
 
@@ -56,6 +57,7 @@ const PARAM_ORDER: Record<string, string[]> = {
   'upsert-custom': ['index', 'entry', 'originalId'],
   'delete-custom': ['index', 'id'],
   'discover': ['index'],
+  'test-connection': ['index', 'draft'],
   'enable-discovered': ['index', 'model'],
 };
 
