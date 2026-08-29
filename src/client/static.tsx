@@ -3,6 +3,10 @@
  * format). Mounts the `providerHub` Remote namespace and registers the
  * settings page section.
  *
+ * Every operation is defensive: the client half runs inside DSH's renderer,
+ * where an uncaught error can block the startup handshake and push Desktop
+ * into recovery mode. Nothing here may throw.
+ *
  * @module dsh-provider-hub/client/static
  */
 import type * as ReactTypes from 'react';
@@ -13,7 +17,8 @@ import { ProviderHubPage, css, zh, en, type Translate, type Call } from './page.
 declare const React: typeof ReactTypes;
 
 export const name = 'provider-hub';
-export const inject = ['slots', 'remote', 'locale'];
+/** No hard inject: every dependency is acquired defensively at apply time. */
+export const inject: string[] = [];
 
 const NS = 'settings.provider-hub';
 const SLOT_ID = 'provider-hub-settings';
@@ -57,55 +62,113 @@ const PARAM_ORDER: Record<string, string[]> = {
   'restore-catalog': ['index'],
 };
 
-function adoptStyles(cssText: string): void {
-  if (document.getElementById(STYLE_ID) !== null) return;
-  const style = document.createElement('style');
-  style.id = STYLE_ID;
-  style.textContent = cssText;
-  document.head.appendChild(style);
+function adoptStyles(): void {
+  try {
+    if (typeof document === 'undefined') return;
+    if (document.getElementById(STYLE_ID) !== null) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = css;
+    document.head.appendChild(style);
+  } catch {
+    // style adoption is cosmetic; never let it break the renderer
+  }
+}
+
+/** Safe translate fallback: never throws, always returns a string. */
+function safeTranslate(locale: unknown, ns: string): Translate {
+  try {
+    if (locale !== null && typeof locale === 'object' && typeof (locale as { bind?: unknown }).bind === 'function') {
+      const bound = (locale as { bind(ns: string): Translate }).bind(ns);
+      if (typeof bound === 'function') return bound;
+    }
+  } catch {
+    // fall through
+  }
+  return (key: string) => key;
 }
 
 export function apply(ctx: any): void {
-  const locale = ctx.get('locale') ?? ctx.locale;
-  if (locale !== undefined) {
-    ctx.effect(() => locale.register(NS, { zh, en }), 'dsh-provider-hub: dictionaries');
+  try {
+    // --- locale dictionaries (defensive) ---
+    let locale: unknown;
+    try {
+      locale = (ctx?.get ?? (() => undefined))('locale') ?? ctx?.locale;
+    } catch {
+      locale = undefined;
+    }
+    const t: Translate = safeTranslate(locale, NS);
+    if (locale !== undefined && locale !== null && typeof ctx?.effect === 'function') {
+      try {
+        const l = locale as { register?(ns: string, dicts: unknown): unknown };
+        ctx.effect(() => l.register?.(NS, { zh, en }) ?? undefined, 'dsh-provider-hub: dictionaries');
+      } catch {
+        // registration failed; t falls back to identity
+      }
+    }
+    adoptStyles();
+
+    // --- Remote namespace (defensive) ---
+    let remote: any = null;
+    if (typeof ctx?.effect === 'function' && ctx?.remote !== undefined) {
+      try {
+        ctx.effect(async () => {
+          try {
+            const dispose = await ctx.remote.$mount({ package: name, descriptors: INVOCATIONS });
+            const handle = ctx.reflect?.get('remote.providerHub');
+            if (handle === undefined) {
+              void dispose?.();
+              return;
+            }
+            remote = handle;
+            return () => {
+              remote = null;
+              try { void dispose?.(); } catch { /* ignore */ }
+            };
+          } catch {
+            remote = null;
+            return () => { remote = null; };
+          }
+        }, 'dsh-provider-hub: remote');
+      } catch {
+        remote = null;
+      }
+    }
+
+    /** Unwrap the transport envelope, then the business envelope. */
+    const call: Call = async (method, payload) => {
+      if (remote === null) throw new Error(t('remotePending'));
+      const remoteName = METHOD_MAP[method];
+      const args = (PARAM_ORDER[method] ?? []).map((key) => (payload ?? {})[key]);
+      const r = await remote[remoteName](...args);
+      const msgOf = (e: unknown): string =>
+        typeof e === 'string' ? e : (e !== null && typeof e === 'object' && typeof (e as { message?: unknown }).message === 'string' ? (e as { message: string }).message : '');
+      if (r === null || typeof r !== 'object' || (r as { ok?: unknown }).ok !== true) {
+        throw new Error(msgOf((r as { error?: unknown })?.error) || t('callFailed'));
+      }
+      const value = (r as { value?: unknown }).value;
+      if (value !== null && typeof value === 'object' && (value as { ok?: unknown }).ok === true) return value as Record<string, unknown> & { ok: boolean };
+      throw new Error(msgOf((value as { error?: unknown } | null | undefined)?.error) || t('callFailed'));
+    };
+
+    // --- settings section slot (defensive, mirror official inject pattern) ---
+    const slots = (ctx?.get ?? (() => undefined))('slots') ?? ctx?.slots;
+    if (slots === undefined || typeof slots.inject !== 'function') return;
+    try {
+      slots.inject('settings.section', () => {
+        try {
+          return slots.register(
+            { name: 'settings.section', id: SLOT_ID, order: SLOT_ORDER, label: () => t('nav') },
+            () => React.createElement(ProviderHubPage, { t, call }),
+          );
+        } catch {
+          return undefined;
+        }
+      });
+    } catch {
+      // slot registration failed; nothing else to do
+    }
+  } catch {
+    // last-resort: never let the client half break the renderer
   }
-  const t: Translate = locale !== undefined ? locale.bind(NS) : (key: string) => key;
-  adoptStyles(css);
-
-  // Mount the providerHub Remote namespace, then resolve its handle through
-  // the service store (ctx.reflect.get), not a dotted ctx read.
-  let remote: any = null;
-  ctx.effect(async () => {
-    const dispose = await ctx.remote.$mount({ package: name, descriptors: INVOCATIONS });
-    const handle = ctx.reflect.get('remote.providerHub');
-    if (handle === undefined) {
-      throw new Error('dsh-provider-hub: the providerHub Remote namespace did not mount');
-    }
-    remote = handle;
-    return () => { remote = null; void dispose(); };
-  }, 'dsh-provider-hub: remote');
-
-  /** Unwrap the transport envelope, then the business envelope. */
-  const call: Call = async (method, payload) => {
-    if (remote === null) throw new Error(t('remotePending'));
-    const remoteName = METHOD_MAP[method];
-    const args = (PARAM_ORDER[method] ?? []).map((key) => (payload ?? {})[key]);
-    const r = await remote[remoteName](...args);
-    const msgOf = (e: unknown): string =>
-      typeof e === 'string' ? e : (e !== null && typeof e === 'object' && typeof (e as { message?: unknown }).message === 'string' ? (e as { message: string }).message : '');
-    if (r === null || typeof r !== 'object' || (r as { ok?: unknown }).ok !== true) {
-      throw new Error(msgOf((r as { error?: unknown })?.error) || t('callFailed'));
-    }
-    const value = (r as { value?: unknown }).value;
-    if (value !== null && typeof value === 'object' && (value as { ok?: unknown }).ok === true) return value as Record<string, unknown> & { ok: boolean };
-    throw new Error(msgOf((value as { error?: unknown } | null | undefined)?.error) || t('callFailed'));
-  };
-
-  const slots = ctx.get('slots') ?? ctx.slots;
-  if (slots === undefined) return;
-  slots.inject('settings.section', () => slots.register(
-    { name: 'settings.section', id: SLOT_ID, order: SLOT_ORDER, label: () => t('nav') },
-    () => React.createElement(ProviderHubPage, { t, call }),
-  ));
 }
