@@ -10,7 +10,6 @@
  * @module dsh-provider-hub/client/static
  */
 import type * as ReactTypes from 'react';
-import { INVOCATIONS } from '../host/contract.ts';
 import { ProviderHubPage, css, zh, en, type Translate, type Call } from './page.tsx';
 
 // React is provided as a global by the DSH client runtime.
@@ -109,33 +108,44 @@ export function apply(ctx: any): void {
     adoptStyles();
 
     // --- Remote namespace (defensive) ---
+    // The host registers the `providerHub` Remote through typert; the client
+    // runtime exposes it as `ctx.remote.providerHub` (a generated proxy).
+    // There is NO `$mount` on the client remote service — calling it throws.
     let remote: any = null;
-    if (typeof ctx?.effect === 'function' && ctx?.remote !== undefined) {
+    const tryGetRemote = (): any => {
       try {
+        const r = ctx?.remote;
+        if (r === null || typeof r !== 'object') return null;
+        return r.providerHub ?? null;
+      } catch {
+        return null;
+      }
+    };
+    remote = tryGetRemote();
+    if (remote === null && typeof ctx?.effect === 'function') {
+      try {
+        // The Remote proxy may appear after the host manifest registers;
+        // retry briefly (a few ticks) without ever throwing.
         ctx.effect(async () => {
           try {
-            const dispose = await ctx.remote.$mount({ package: name, descriptors: INVOCATIONS });
-            const handle = ctx.reflect?.get('remote.providerHub');
-            if (handle === undefined) {
-              void dispose?.();
-              return;
+            for (let i = 0; i < 50; i++) {
+              const hit = tryGetRemote();
+              if (hit !== null) {
+                remote = hit;
+                return;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 50));
             }
-            remote = handle;
-            return () => {
-              remote = null;
-              try { void dispose?.(); } catch { /* ignore */ }
-            };
           } catch {
             remote = null;
-            return () => { remote = null; };
           }
-        }, 'dsh-provider-hub: remote');
+        }, 'dsh-provider-hub: remote wait');
       } catch {
         remote = null;
       }
     }
 
-    /** Unwrap the transport envelope, then the business envelope. */
+    /** Unwrap the business envelope (the remote proxy returns it directly). */
     const call: Call = async (method, payload) => {
       if (remote === null) throw new Error(t('remotePending'));
       const remoteName = METHOD_MAP[method];
@@ -146,9 +156,7 @@ export function apply(ctx: any): void {
       if (r === null || typeof r !== 'object' || (r as { ok?: unknown }).ok !== true) {
         throw new Error(msgOf((r as { error?: unknown })?.error) || t('callFailed'));
       }
-      const value = (r as { value?: unknown }).value;
-      if (value !== null && typeof value === 'object' && (value as { ok?: unknown }).ok === true) return value as Record<string, unknown> & { ok: boolean };
-      throw new Error(msgOf((value as { error?: unknown } | null | undefined)?.error) || t('callFailed'));
+      return r as Record<string, unknown> & { ok: boolean };
     };
 
     // --- settings section slot (defensive, mirror official inject pattern) ---
