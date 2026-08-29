@@ -25,7 +25,7 @@ import {
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm';
 import { catalogEntryFor, reasoningMetadata, resolveModelEntries } from './catalog.ts';
-import type { GatewayConfig, WireConfig, WireModelEntry } from './types.ts';
+import type { GatewayConfig, WireConfig } from './types.ts';
 import { errorFinish } from './wire/sse.ts';
 import { anthropicSseToChunks, toAnthropicMessages, toAnthropicTools } from './wire/anthropic.ts';
 import { openaiCompletionsToChunks, toOpenAIMessages, toOpenAITools } from './wire/openai.ts';
@@ -38,8 +38,6 @@ export interface AdapterDeps {
   gatewayFor(provider: string): GatewayConfig | undefined;
   /** API-key resolver for one gateway. */
   resolveApiKey(gw: GatewayConfig): Promise<string>;
-  /** Runtime entry imported from another provider route for one gateway (may be undefined). */
-  preset(provider: string): WireModelEntry | undefined;
 }
 
 export class GatewayAdapter extends LlmAdapter {
@@ -62,7 +60,7 @@ export class GatewayAdapter extends LlmAdapter {
   listModels(provider: string): Promise<readonly LlmModelInfo[]> {
     const gw = this.deps.gatewayFor(provider);
     if (gw === undefined) return Promise.resolve([]);
-    return Promise.resolve(resolveModelEntries(gw, this.deps.preset(provider)).map((entry) => ({
+    return Promise.resolve(resolveModelEntries(gw).map((entry) => ({
       provider,
       id: entry.id,
       name: entry.name,
@@ -77,7 +75,7 @@ export class GatewayAdapter extends LlmAdapter {
         'UNKNOWN_MODEL',
       ));
     }
-    const entry = catalogEntryFor(gw, model, this.deps.preset(provider));
+    const entry = catalogEntryFor(gw, model);
     if (entry === undefined) {
       return Promise.reject(new LlmError(
         `llm-provider-hub: model "${model}" is not enabled on gateway "${provider}"; enable it in the provider-hub plugin settings`,

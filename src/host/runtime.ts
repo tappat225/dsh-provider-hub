@@ -18,7 +18,7 @@
  * @module dsh-provider-hub/host/runtime
  */
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
-import type { LlmModelInfo, LlmDiscoveredModel, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm';
+import type { LlmDiscoveredModel } from '@deepseek-ai/dsh-llm';
 import { MODEL_CATALOG, resolveModelEntries } from '../catalog.ts';
 import { discoverModels } from '../discovery.ts';
 import type { GatewayConfig, WireConfig } from '../types.ts';
@@ -55,14 +55,6 @@ interface SettingsView {
 /** A settings write refused because the namespace moved since it was read. */
 function isSettingsConflict(error: unknown): boolean {
   return error instanceof Error && error.message.includes('SETTINGS_CONFLICT') || (error !== null && typeof error === 'object' && (error as { code?: unknown }).code === 'SETTINGS_CONFLICT');
-}
-
-/** LLM service surface used by the runtime. */
-interface LlmLike {
-  listProviders(): Array<{ id: string; name: string }>;
-  listConfigurableProviders(): Array<{ provider: string; displayName: string }>;
-  listModels(provider: string): Promise<readonly LlmModelInfo[]>;
-  resolveModelInfo(provider: string, model: string): Promise<LlmResolvedModelInfo>;
 }
 
 export interface ProviderHubRuntimeDeps {
@@ -135,10 +127,6 @@ export class ProviderHubRuntime extends TypertRemoteService {
     return this.writeOps(st, [{ op: 'set', path: ['gateways'], value: gateways }]);
   }
 
-  private llm(): LlmLike | undefined {
-    return this.hostCtx.get<LlmLike>('llm');
-  }
-
   /** Gateway at index, or undefined. */
   private gatewayAt(index: number): GatewayConfig | undefined {
     return this.deps.current().gateways[index];
@@ -159,7 +147,6 @@ export class ProviderHubRuntime extends TypertRemoteService {
           index,
           gateway: gw,
           models: resolveModelEntries(gw),
-          preset: gw.presetFrom,
         })),
         catalog: MODEL_CATALOG,
       });
@@ -297,79 +284,6 @@ export class ProviderHubRuntime extends TypertRemoteService {
   }
 
   /** Set or clear the presetFrom import on one gateway. */
-  async setPresetFrom(index: number, preset: { provider: string; model: string } | null): Promise<Envelope> {
-    try {
-      const st = this.settings();
-      if (st === undefined) return fail('settings service unavailable');
-      const gw = this.gatewayAt(index);
-      if (gw === undefined) return fail('gateway index out of range');
-      const config = this.deps.current();
-      const next = config.gateways.map((g, i) => {
-        if (i !== index) return g;
-        if (preset === null) {
-          const copy = { ...g };
-          delete (copy as { presetFrom?: unknown }).presetFrom;
-          return copy;
-        }
-        return { ...g, presetFrom: preset };
-      });
-      await this.setGateways(st, next);
-      return ok({});
-    } catch (error) {
-      return fail(error);
-    }
-  }
-
-  /** Registered provider routes the user can import presets from. */
-  async listPresets(): Promise<Envelope> {
-    try {
-      const llm = this.llm();
-      if (llm === undefined) return fail('llm service unavailable');
-      const registered = new Map(llm.listProviders().map((p) => [p.id, p.name]));
-      const dir = llm.listConfigurableProviders();
-      const seen = new Set<string>();
-      const providers: Array<{ provider: string; displayName: string }> = [];
-      for (const entry of dir) {
-        if (seen.has(entry.provider)) continue;
-        seen.add(entry.provider);
-        providers.push({ provider: entry.provider, displayName: entry.displayName });
-      }
-      for (const [id, name] of registered) {
-        if (seen.has(id)) continue;
-        seen.add(id);
-        providers.push({ provider: id, displayName: name });
-      }
-      return ok({ providers });
-    } catch (error) {
-      return fail(error);
-    }
-  }
-
-  /** Models one preset provider currently advertises. */
-  async presetModels(provider: string): Promise<Envelope> {
-    try {
-      const llm = this.llm();
-      if (llm === undefined) return fail('llm service unavailable');
-      const models = await llm.listModels(provider);
-      return ok({ models: [...models] });
-    } catch (error) {
-      return fail(error);
-    }
-  }
-
-  /** One preset model's full capability metadata. */
-  async presetModelInfo(provider: string, model: string): Promise<Envelope> {
-    try {
-      const llm = this.llm();
-      if (llm === undefined) return fail('llm service unavailable');
-      const info = await llm.resolveModelInfo(provider, model);
-      return ok({ info });
-    } catch (error) {
-      return fail(error);
-    }
-  }
-
-  /** Discover models from one gateway (custom UA applied). */
   async discover(index: number): Promise<Envelope> {
     try {
       const gw = this.gatewayAt(index);

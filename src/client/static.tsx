@@ -43,10 +43,6 @@ const METHOD_MAP: Record<string, string> = {
   'save-overrides': 'saveOverrides',
   'upsert-custom': 'upsertCustom',
   'delete-custom': 'deleteCustom',
-  'set-preset-from': 'setPresetFrom',
-  'list-presets': 'listPresets',
-  'preset-models': 'presetModels',
-  'preset-model-info': 'presetModelInfo',
   'discover': 'discover',
   'enable-discovered': 'enableDiscovered',
 };
@@ -59,9 +55,6 @@ const PARAM_ORDER: Record<string, string[]> = {
   'save-overrides': ['index', 'overrides'],
   'upsert-custom': ['index', 'entry', 'originalId'],
   'delete-custom': ['index', 'id'],
-  'set-preset-from': ['index', 'preset'],
-  'preset-models': ['provider'],
-  'preset-model-info': ['provider', 'model'],
   'discover': ['index'],
   'enable-discovered': ['index', 'model'],
 };

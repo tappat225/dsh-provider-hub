@@ -29,14 +29,6 @@ export interface CustomModel {
   reasoningEfforts?: ReasoningEffortMap;
 }
 
-/** Import one model's capability parameters from another registered provider route. */
-export interface PresetFrom {
-  /** Provider route already registered in DSH (e.g. a configured llm-pi-ai route like `shuai-claude`). */
-  provider: string;
-  /** Exact model id to import. */
-  model: string;
-}
-
 /**
  * One gateway (provider route) configuration. Mirrors the per-gateway object
  * schema in `src/index.ts`; keep both in sync.
@@ -68,8 +60,6 @@ export interface GatewayConfig {
   modelOverrides: Record<string, ModelOverride>;
   /** Fully-specified custom models. */
   customModels: CustomModel[];
-  /** Import one model's capability parameters from another registered provider route. */
-  presetFrom?: PresetFrom;
 }
 
 /**

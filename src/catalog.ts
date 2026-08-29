@@ -149,11 +149,9 @@ function isUnset(value: unknown): boolean {
 
 /**
  * Resolve every model one gateway serves: enabled built-in catalog entries
- * (with field-level `modelOverrides`), fully-specified custom models, and a
- * runtime `presetEntry` imported from another provider route (only when the
- * id is not already covered by the catalog or custom models).
+ * (with field-level `modelOverrides`) and fully-specified custom models.
  */
-export function resolveModelEntries(gw: GatewayConfig, presetEntry?: WireModelEntry): WireModelEntry[] {
+export function resolveModelEntries(gw: GatewayConfig): WireModelEntry[] {
   const out: WireModelEntry[] = [];
   const overrides = gw.modelOverrides ?? {};
   for (const id of gw.enabledModels ?? []) {
@@ -186,15 +184,12 @@ export function resolveModelEntries(gw: GatewayConfig, presetEntry?: WireModelEn
       reasoning: custom.reasoningEfforts,
     });
   }
-  if (presetEntry !== undefined && !out.some((entry) => entry.id === presetEntry.id)) {
-    out.push(presetEntry);
-  }
   return out;
 }
 
 /** Capability entry for one exact model id on one gateway, or undefined when not enabled. */
-export function catalogEntryFor(gw: GatewayConfig, model: string, presetEntry?: WireModelEntry): WireModelEntry | undefined {
-  return resolveModelEntries(gw, presetEntry).find((entry) => entry.id === model);
+export function catalogEntryFor(gw: GatewayConfig, model: string): WireModelEntry | undefined {
+  return resolveModelEntries(gw).find((entry) => entry.id === model);
 }
 
 /** Convert a reasoning-effort map into DSH LlmModelReasoningInfo shape. */

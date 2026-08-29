@@ -155,10 +155,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     { id: '', name: '', contextWindow: '', maxTokens: '' });
   const [overridesText, setOverridesText] = React.useState<Record<number, string>>({});
   const [headersText, setHeadersText] = React.useState<Record<number, string>>({});
-  const [presetProviders, setPresetProviders] = React.useState<Array<{ provider: string; displayName: string }>>([]);
-  const [presetModels, setPresetModels] = React.useState<Record<number, Array<{ id: string; name: string }>>>({});
-  const [presetProvider, setPresetProvider] = React.useState<Record<number, string>>({});
-  const [presetModel, setPresetModel] = React.useState<Record<number, string>>({});
   const [discovered, setDiscovered] = React.useState<Record<number, DiscoveredModel[] | null>>({});
 
   const refresh = React.useCallback(async () => {
@@ -178,8 +174,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       }
       setOverridesText(nextOverrides);
       setHeadersText(nextHeaders);
-      const rp = await call('list-presets');
-      if (rp.ok) setPresetProviders((rp as unknown as { providers: Array<{ provider: string; displayName: string }> }).providers);
     } catch {
       // Remote may not be ready yet (or a transient call failure): show a
       // hint instead of crashing the renderer.
@@ -335,47 +329,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         void refresh();
       }
     })();
-  };
-
-  const importPreset = async () => {
-    const selected = state.selected;
-    if (selected === null) return;
-    const pv = presetProvider[selected] ?? '';
-    const mv = presetModel[selected] ?? '';
-    if (pv === '' || mv === '') return;
-    const r = await call('preset-model-info', { provider: pv, model: mv });
-    if (!r.ok) {
-      setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-      return;
-    }
-    const info = (r as unknown as { info: { id: string; name?: string; context?: { contextWindow?: number }; defaultMaxTokens?: number } }).info;
-    const entry: Record<string, unknown> = {
-      id: info.id,
-      name: info.name ?? info.id,
-      contextWindow: info.context?.contextWindow,
-      maxTokens: info.defaultMaxTokens,
-    };
-    // enable-discovered applies catalog auto-config when the id hits the
-    // built-in catalog; otherwise it inserts a custom model.
-    const r2 = await call('enable-discovered', { index: selected, model: entry });
-    if (!r2.ok) setStatus({ kind: 'err', text: String((r2 as { error?: unknown }).error ?? '') });
-    else {
-      setStatus({ kind: 'ok', text: `${info.id} ${t('importPreset')} ✓` });
-      void refresh();
-    }
-  };
-
-  const loadPresetModels = async (provider: string) => {
-    const selected = state.selected;
-    if (selected === null) return;
-    setPresetProvider((p) => ({ ...p, [selected]: provider }));
-    setPresetModel((p) => ({ ...p, [selected]: '' }));
-    if (provider === '') {
-      setPresetModels((p) => ({ ...p, [selected]: [] }));
-      return;
-    }
-    const r = await call('preset-models', { provider });
-    if (r.ok) setPresetModels((p) => ({ ...p, [selected]: (r as unknown as { models: Array<{ id: string; name: string }> }).models }));
   };
 
   const runDiscover = async () => {
@@ -573,6 +526,32 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
               React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
             )),
           ),
+        // Built-in preset models: pick one of our curated catalog entries —
+        // the add form fills the id/params for you (params apply on enable).
+        React.createElement('div', { className: 'phub-editor-note', style: { paddingTop: 10 } }, t('builtinPresetHint')),
+        Row({
+          title: t('builtinPreset'),
+          control: React.createElement(SelectMenu, {
+            label: t('builtinPreset'),
+            value: '',
+            options: [
+              { value: '', title: '—' },
+              ...Object.entries(state.catalog).sort(([a], [b]) => a.localeCompare(b)).map(([id, entry]) => ({
+                value: id,
+                title: `${entry.name} · ${id}`,
+              })),
+            ],
+            onChange: (next) => {
+              const entry = next === '' ? undefined : state.catalog[next];
+              setAddModelDraft({
+                id: next,
+                name: '',
+                contextWindow: entry === undefined ? '' : String(entry.contextWindow),
+                maxTokens: entry === undefined ? '' : String(entry.maxTokens),
+              });
+            },
+          }),
+        }),
         // Add-model row: catalog ids auto-fill params, others become custom.
         Row({
           title: t('addModel'),
@@ -618,32 +597,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         React.createElement('div', { className: 'phub-actions' },
           React.createElement('button', { className: 'phub-btn', onClick: saveOverrides }, `${t('overrides')}: ${t('save')}`),
         ),
-        Row({
-          title: t('presetFrom'),
-          desc: t('presetHint'),
-          control: React.createElement('span', { className: 'phub-control' },
-            React.createElement(SelectMenu, {
-              label: t('presetProvider'),
-              value: presetProvider[selected] ?? '',
-              options: [
-                { value: '', title: '—' },
-                ...presetProviders.map((p) => ({ value: p.provider, title: `${p.displayName} (${p.provider})` })),
-              ],
-              onChange: (next) => void loadPresetModels(next),
-            }),
-            React.createElement(SelectMenu, {
-              label: t('presetModel'),
-              value: presetModel[selected] ?? '',
-              disabled: (presetModels[selected] ?? []).length === 0,
-              options: [
-                { value: '', title: '—' },
-                ...(presetModels[selected] ?? []).map((m) => ({ value: m.id, title: m.name ?? m.id })),
-              ],
-              onChange: (next) => setPresetModel((p) => ({ ...p, [selected]: next })),
-            }),
-            React.createElement('button', { className: 'phub-btn', disabled: (presetModel[selected] ?? '') === '', onClick: () => void importPreset() }, t('importPreset')),
-          ),
-        }),
         React.createElement('div', { className: 'phub-actions' },
           React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void runDiscover() }, t('discover')),
           React.createElement('span', { className: 'phub-editor-note' }, t('discoverHint')),

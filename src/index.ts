@@ -37,7 +37,7 @@ import { MODEL_CATALOG, resolveModelEntries } from './catalog.ts';
 import { discoverModels } from './discovery.ts';
 import { ProviderHubRuntime } from './host/runtime.ts';
 import { TYPERT_MANIFEST } from './host/contract.ts';
-import type { GatewayConfig, WireConfig, WireModelEntry } from './types.ts';
+import type { GatewayConfig, WireConfig } from './types.ts';
 
 export const name = 'provider-hub';
 
@@ -93,11 +93,6 @@ const GatewaySchema = z.object({
     input: z.array(z.union(['text', 'image', 'audio'])).default(['text']),
     reasoningEfforts: z.dict(z.union([z.string(), z.const(null)])),
   })).default([]),
-  /** Import one model's capability parameters from another registered provider route. */
-  presetFrom: z.object({
-    provider: z.string(),
-    model: z.string(),
-  }),
 });
 
 /** Config schema rendered as the plugin settings panel: a list of gateways. */
@@ -120,36 +115,6 @@ export function apply(ctx: Context, config: WireConfig) {
   /** Gateway by provider route (cached per current() call). */
   const gatewayFor = (provider: string): GatewayConfig | undefined =>
     current().gateways.find((gw) => gw.provider === provider);
-
-  // Runtime entries imported from another provider route (presetFrom), one per
-  // gateway. Loaded asynchronously at startup; a failure degrades to "not
-  // imported" instead of blocking plugin mount.
-  const presetEntries = new Map<string, WireModelEntry>();
-  const loadPreset = async (): Promise<void> => {
-    const next = new Map<string, WireModelEntry>();
-    for (const gw of current().gateways) {
-      const preset = gw.presetFrom;
-      if (preset === undefined) continue;
-      try {
-        const info = await ctx.llm.resolveModelInfo(preset.provider, preset.model);
-        next.set(gw.provider, {
-          id: preset.model,
-          name: info.name ?? preset.model,
-          contextWindow: info.context?.contextWindow ?? 128000,
-          maxTokens: info.defaultMaxTokens ?? 8192,
-          ...(info.inputModalities === undefined ? {} : { input: [...info.inputModalities] }),
-          ...(info.reasoning === undefined
-            ? {}
-            : { reasoning: Object.fromEntries(info.reasoning.efforts.map((effort) => [effort.id, effort.id])) }),
-        });
-      } catch {
-        // keep undefined for this gateway: preset import degrades gracefully
-      }
-    }
-    presetEntries.clear();
-    for (const [provider, entry] of next) presetEntries.set(provider, entry);
-  };
-  void loadPreset();
 
   const resolveApiKey = async (gw: GatewayConfig): Promise<string> => {
     if (typeof gw.apiKey === 'string' && gw.apiKey.trim() !== '') {
@@ -175,7 +140,6 @@ export function apply(ctx: Context, config: WireConfig) {
     current: () => current(),
     gatewayFor,
     resolveApiKey,
-    preset: (provider: string) => presetEntries.get(provider),
   });
 
   // Live LLM route registration. The configuration at apply time is the

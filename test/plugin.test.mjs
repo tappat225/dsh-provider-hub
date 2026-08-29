@@ -261,24 +261,8 @@ check('openai tools: usage chunk emitted', oaiToolsUsage !== undefined, JSON.str
 check('openai tools: cached input split (input 40, cacheRead 60, output 25)', oaiToolsUsage?.inputTokens === 40 && oaiToolsUsage?.cacheReadTokens === 60 && oaiToolsUsage?.outputTokens === 25, JSON.stringify(oaiToolsUsage));
 check('openai tools: wire tools param', (lastSeenHeaders?.body ?? '').includes('"tools"'), JSON.stringify(lastSeenHeaders?.body));
 
-// 6d. presetFrom: preset entry joins the catalog (per gateway)
-const presetConfig = plugin.Config({ gateways: [{
-  provider: 'air-outer',
-  baseURL: 'http://x',
-  api: 'anthropic-messages',
-  apiKey: 'k',
-  presetFrom: { provider: 'shuai-claude', model: 'claude-sonnet-4-6' },
-}] }).gateways[0];
-const presetAdapter = new (Object.getPrototypeOf(adapter).constructor)({
-  current: () => ({ gateways: [presetConfig] }),
-  gatewayFor: (p) => presetConfig.provider === p ? presetConfig : undefined,
-  resolveApiKey: async () => 'k',
-  preset: () => ({ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', contextWindow: 1000000, maxTokens: 32768, input: ['text', 'image'] }),
-});
-const presetListed = await presetAdapter.listModels('air-outer');
-check('presetFrom: model listed', presetListed.some((m) => m.id === 'claude-sonnet-4-6'), JSON.stringify(presetListed.map((m) => m.id)));
-const presetResolved = await presetAdapter.resolveModel('air-outer', 'claude-sonnet-4-6');
-check('presetFrom: params resolved', presetResolved.context?.contextWindow === 1000000 && presetResolved.defaultMaxTokens === 32768, JSON.stringify(presetResolved));
+// 6d. custom model with empty params defaults (kept for catalog coverage)
+// (presetFrom was removed by design — no cross-provider import feature.)
 
 // 9. ProviderHubRuntime (client-half remote service) with fake settings/llm — gateway-indexed
 const { ProviderHubRuntime } = await import('../src/host/runtime.ts');
@@ -347,14 +331,6 @@ const dg2 = await runtime.deleteGateway(2);
 check('runtime deleteGateway 2', dg2.ok === true && stored.gateways.length === 2, JSON.stringify({ gateways: stored.gateways.length }));
 const dg = await runtime.deleteGateway(1);
 check('runtime deleteGateway', dg.ok === true && stored.gateways.length === 1, JSON.stringify({ gateways: stored.gateways.length }));
-const lp = await runtime.listPresets();
-check('runtime listPresets', lp.ok === true && lp.providers.some((p) => p.provider === 'shuai-claude'), JSON.stringify(lp.providers));
-const pm = await runtime.presetModels('shuai-claude');
-check('runtime presetModels', pm.ok === true && pm.models[0]?.id === 'claude-opus-4-8');
-const pmi = await runtime.presetModelInfo('shuai-claude', 'claude-opus-4-8');
-check('runtime presetModelInfo', pmi.ok === true && pmi.info.context?.contextWindow === 1000000, JSON.stringify(pmi.info));
-const spf = await runtime.setPresetFrom(0, { provider: 'shuai-claude', model: 'claude-opus-4-8' });
-check('runtime setPresetFrom', spf.ok === true && stored.gateways[0].presetFrom?.model === 'claude-opus-4-8');
 const rd = await runtime.discover(0);
 check('runtime discover via echo', rd.ok === true && rd.models.length === 2 && rd.models[0].id === 'glm-5.3', JSON.stringify(rd.models));
 const ro = await runtime.saveOverrides(0, { 'glm-5.3': { contextWindow: 999999 } });
