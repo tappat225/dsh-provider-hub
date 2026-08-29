@@ -525,7 +525,11 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         fieldRow('baseURL', `${t('baseURL')} *`, undefined, t('baseURLPlaceholder')),
         Row({
           title: t('api'),
-          control: SelectMenu({
+          // MUST be a React element (createElement), never a direct call:
+          // SelectMenu holds hooks (useState) and a direct call would attach
+          // them to the parent fiber with a conditional order — React throws
+          // "rendered more/less hooks" and the settings panel blanks.
+          control: React.createElement(SelectMenu, {
             label: t('api'),
             value: String(cfg.api ?? 'anthropic-messages'),
             options: [{ value: 'anthropic-messages', title: 'anthropic-messages' }, { value: 'openai-completions', title: 'openai-completions' }],
@@ -654,7 +658,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
           title: t('presetFrom'),
           desc: t('presetHint'),
           control: React.createElement('span', { className: 'phub-control' },
-            SelectMenu({
+            React.createElement(SelectMenu, {
               label: t('presetProvider'),
               value: presetProvider[selected] ?? '',
               options: [
@@ -663,7 +667,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
               ],
               onChange: (next) => void loadPresetModels(next),
             }),
-            SelectMenu({
+            React.createElement(SelectMenu, {
               label: t('presetModel'),
               value: presetModel[selected] ?? '',
               disabled: (presetModels[selected] ?? []).length === 0,

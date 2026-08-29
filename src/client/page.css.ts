@@ -69,6 +69,9 @@ export default `
 .phub-status-ok { color: #98c379; }
 .phub-status-err { color: #e06c75; }
 
+/* Error-boundary fallback. */
+.phub-error { margin: 0; padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: 12px/1.6 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
+
 /* Editor internals. */
 .phub-editor-note { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); padding: 0 8px; }
 .phub-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 8px 0; }

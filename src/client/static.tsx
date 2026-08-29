@@ -96,6 +96,45 @@ function safeTranslate(locale: unknown, ns: string): Translate {
   return (key: string) => key;
 }
 
+/**
+ * Render error boundary for the settings section. A renderer-side throw in
+ * the page (e.g. a React hook-order violation) would otherwise blank the
+ * whole settings panel with no feedback; this shows the message + a retry.
+ * The class component only touches React, which is safe inside the renderer.
+ */
+class PageBoundary extends React.Component<{ children: ReactTypes.ReactNode }, { error: string | null }> {
+  constructor(props: { children: ReactTypes.ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error: unknown): { error: string } {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+
+  componentDidCatch(error: unknown): void {
+    try {
+      console.error('provider-hub settings page error', error);
+    } catch {
+      // console must never break the boundary
+    }
+  }
+
+  render(): ReactTypes.ReactNode {
+    if (this.state.error !== null) {
+      return React.createElement('div', { className: 'phub-page' },
+        React.createElement('p', { className: 'phub-intro' }, 'Provider Hub page crashed'),
+        React.createElement('pre', { className: 'phub-error' }, this.state.error),
+        React.createElement('button', {
+          className: 'phub-btn',
+          onClick: () => this.setState({ error: null }),
+        }, '重试 / Retry'),
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export function apply(ctx: any): void {
   try {
     // --- locale dictionaries (defensive) ---
@@ -199,7 +238,7 @@ export function apply(ctx: any): void {
         try {
           return slots.register(
             { name: 'settings.section', id: SLOT_ID, order: SLOT_ORDER, label: () => t('nav') },
-            () => React.createElement(ProviderHubPage, { t, call }),
+            () => React.createElement(PageBoundary, null, React.createElement(ProviderHubPage, { t, call })),
           );
         } catch {
           return undefined;

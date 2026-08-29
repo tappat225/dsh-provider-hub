@@ -50,7 +50,15 @@ check('registration id = dsh-provider-hub (loader entry name)', registration.id 
 check('factory is a function', typeof registration.factory === 'function');
 
 // Materialize: the module system's require answers seed words only.
-const reactStub = { createElement: () => ({}), Fragment: Symbol('fragment') };
+// PageBoundary extends React.Component, so the stub carries a base class.
+const reactStub = {
+  createElement: () => ({}),
+  Fragment: Symbol('fragment'),
+  Component: class {
+    constructor(props) { this.props = props ?? {}; this.state = null; }
+    setState(patch) { this.state = { ...this.state, ...patch }; }
+  },
+};
 // The renderer seed table provides dsh-client-ui-primitives (see
 // dsh-web-frontend/dist/assets/index-*.js seed map); the page imports its
 // Menu primitive + chevron icon. Stub both (the page component never renders
