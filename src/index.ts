@@ -183,13 +183,13 @@ export function apply(ctx: Context, config: WireConfig) {
   });
 
   const providers = current().gateways.map((gw) => gw.provider);
-  ctx.llm.registerConfigurableProviders(current().gateways.map((gw) => ({
-    provider: gw.provider,
-    displayName: gw.displayName || DEFAULT_DISPLAY_NAME,
-    settingsNs: NS,
-    settingsPath: [],
-  })));
   if (providers.length > 0) {
+    ctx.llm.registerConfigurableProviders(current().gateways.map((gw) => ({
+      provider: gw.provider,
+      displayName: gw.displayName || DEFAULT_DISPLAY_NAME,
+      settingsNs: NS,
+      settingsPath: [],
+    })));
     ctx.llm.registerAdapter(providers, adapter);
   }
   ctx.llm.registerModelDiscovery(NS, (request) => {

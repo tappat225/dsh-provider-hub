@@ -81,6 +81,28 @@ plugin.apply(fakeCtx, multiConfig);
 check('registerConfigurableProviders: 2 gateways', registered.providers.length === 2 && registered.providers[0].provider === 'air-outer' && registered.providers[1].provider === 'gw-b', JSON.stringify(registered.providers));
 check('registerAdapter: 2 routes', registered.adapter?.providers?.length === 2 && registered.adapter.providers.includes('air-outer') && registered.adapter.providers.includes('gw-b'), JSON.stringify(registered.adapter?.providers));
 
+// 4b. Empty-gateway startup must not throw (dsh-llm rejects empty configurable-provider registration)
+const emptyRegistered = { providers: undefined, adapter: undefined };
+const emptyCtx = {
+  get: () => undefined,
+  llm: {
+    registerConfigurableProviders: (entries) => { emptyRegistered.providers = entries; },
+    registerAdapter: (providers, adapter) => { emptyRegistered.adapter = { providers, adapter }; },
+    registerModelDiscovery: () => {},
+  },
+  inject: () => {},
+  logger: { info: () => {}, warn: () => {} },
+};
+let emptyThrew = false;
+try {
+  plugin.apply(emptyCtx, plugin.Config({ gateways: [] }));
+} catch (e) {
+  emptyThrew = true;
+  console.log('[empty-gateway] threw:', e?.message);
+}
+check('empty gateway: apply does not throw', !emptyThrew);
+check('empty gateway: no providers registered', emptyRegistered.providers === undefined && emptyRegistered.adapter === undefined, JSON.stringify({ providers: emptyRegistered.providers, adapter: emptyRegistered.adapter }));
+
 const adapter = registered.adapter.adapter;
 const listedA = await adapter.listModels('air-outer');
 const listedB = await adapter.listModels('gw-b');
