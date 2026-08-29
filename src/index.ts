@@ -210,11 +210,9 @@ export function apply(ctx: Context, config: WireConfig) {
   // the same configuration through this namespace.
   ctx.inject(['typert'], (typertCtx) => {
     new ProviderHubRuntime(typertCtx as never, { current, resolveApiKey, gatewayFor });
-    const register = (typertCtx.typert as unknown as { register(manifest: unknown): unknown }).register;
-    (typertCtx.effect as (execute: () => unknown, label?: string) => unknown)(
-      () => register(TYPERT_MANIFEST),
-      'dsh-provider-hub: typert manifest',
-    );
+    // Mirror the official dsh-typert-loader pattern: ctx.typert.register(manifest)
+    // (keeps `this` bound — destructuring the method would crash the loader).
+    (typertCtx.typert as unknown as { register(manifest: unknown): unknown }).register(TYPERT_MANIFEST);
   });
 
   installSettingsSection(ctx, NS, Config, config, {
