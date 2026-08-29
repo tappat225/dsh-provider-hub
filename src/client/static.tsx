@@ -145,18 +145,25 @@ export function apply(ctx: any): void {
       }
     }
 
-    /** Unwrap the business envelope (the remote proxy returns it directly). */
+    /** Unwrap the business envelope. NEVER throws: a failed/unavailable
+     *  remote returns `{ ok: false, error }` so React callers cannot crash
+     *  the renderer with an unhandled rejection. */
     const call: Call = async (method, payload) => {
-      if (remote === null) throw new Error(t('remotePending'));
-      const remoteName = METHOD_MAP[method];
-      const args = (PARAM_ORDER[method] ?? []).map((key) => (payload ?? {})[key]);
-      const r = await remote[remoteName](...args);
-      const msgOf = (e: unknown): string =>
-        typeof e === 'string' ? e : (e !== null && typeof e === 'object' && typeof (e as { message?: unknown }).message === 'string' ? (e as { message: string }).message : '');
-      if (r === null || typeof r !== 'object' || (r as { ok?: unknown }).ok !== true) {
-        throw new Error(msgOf((r as { error?: unknown })?.error) || t('callFailed'));
+      try {
+        if (remote === null) return { ok: false, error: t('remotePending') };
+        const remoteName = METHOD_MAP[method];
+        if (remoteName === undefined) return { ok: false, error: `unknown method ${method}` };
+        const args = (PARAM_ORDER[method] ?? []).map((key) => (payload ?? {})[key]);
+        const r = await remote[remoteName](...args);
+        const msgOf = (e: unknown): string =>
+          typeof e === 'string' ? e : (e !== null && typeof e === 'object' && typeof (e as { message?: unknown }).message === 'string' ? (e as { message: string }).message : '');
+        if (r === null || typeof r !== 'object' || (r as { ok?: unknown }).ok !== true) {
+          return { ok: false, error: msgOf((r as { error?: unknown })?.error) || t('callFailed') };
+        }
+        return r as Record<string, unknown> & { ok: boolean };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
-      return r as Record<string, unknown> & { ok: boolean };
     };
 
     // --- settings section slot (defensive, mirror official inject pattern) ---

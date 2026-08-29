@@ -67,33 +67,39 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   const [discovered, setDiscovered] = React.useState<Record<number, DiscoveredModel[] | null>>({});
 
   const refresh = React.useCallback(async () => {
-    const r = await call('get-state');
-    if (!r.ok) {
-      setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? 'getState failed') });
-      return;
+    try {
+      const r = await call('get-state');
+      if (!r.ok) {
+        setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? 'getState failed') });
+        return;
+      }
+      const value = r as unknown as { gateways: GatewayEntry[]; catalog: State['catalog'] };
+      setState((s) => ({ ...s, gateways: value.gateways, catalog: value.catalog }));
+      const nextCustom: Record<number, Array<Record<string, string>>> = {};
+      const nextOverrides: Record<number, string> = {};
+      const nextHeaders: Record<number, string> = {};
+      for (const g of value.gateways) {
+        nextCustom[g.index] = (g.gateway.customModels as Array<Record<string, unknown>> | undefined ?? []).map((m) => ({
+          id: String(m.id ?? ''),
+          name: String(m.name ?? ''),
+          contextWindow: String(m.contextWindow ?? ''),
+          maxTokens: String(m.maxTokens ?? ''),
+          reasoningEfforts: JSON.stringify(m.reasoningEfforts ?? {}),
+        }));
+        nextOverrides[g.index] = JSON.stringify(g.gateway.modelOverrides ?? {}, null, 2);
+        nextHeaders[g.index] = JSON.stringify(g.gateway.extraHeaders ?? {}, null, 2);
+      }
+      setCustomRows(nextCustom);
+      setOverridesText(nextOverrides);
+      setHeadersText(nextHeaders);
+      const rp = await call('list-presets');
+      if (rp.ok) setPresetProviders((rp as unknown as { providers: Array<{ provider: string; displayName: string }> }).providers);
+    } catch {
+      // Remote may not be ready yet (or a transient call failure): show a
+      // hint instead of crashing the renderer.
+      setStatus({ kind: 'err', text: t('remotePending') });
     }
-    const value = r as unknown as { gateways: GatewayEntry[]; catalog: State['catalog'] };
-    setState((s) => ({ ...s, gateways: value.gateways, catalog: value.catalog }));
-    const nextCustom: Record<number, Array<Record<string, string>>> = {};
-    const nextOverrides: Record<number, string> = {};
-    const nextHeaders: Record<number, string> = {};
-    for (const g of value.gateways) {
-      nextCustom[g.index] = (g.gateway.customModels as Array<Record<string, unknown>> | undefined ?? []).map((m) => ({
-        id: String(m.id ?? ''),
-        name: String(m.name ?? ''),
-        contextWindow: String(m.contextWindow ?? ''),
-        maxTokens: String(m.maxTokens ?? ''),
-        reasoningEfforts: JSON.stringify(m.reasoningEfforts ?? {}),
-      }));
-      nextOverrides[g.index] = JSON.stringify(g.gateway.modelOverrides ?? {}, null, 2);
-      nextHeaders[g.index] = JSON.stringify(g.gateway.extraHeaders ?? {}, null, 2);
-    }
-    setCustomRows(nextCustom);
-    setOverridesText(nextOverrides);
-    setHeadersText(nextHeaders);
-    const rp = await call('list-presets');
-    if (rp.ok) setPresetProviders((rp as unknown as { providers: Array<{ provider: string; displayName: string }> }).providers);
-  }, [call]);
+  }, [call, t]);
 
   React.useEffect(() => { void refresh(); }, [refresh]);
 
