@@ -1,0 +1,5 @@
+# dsh-provider-hub bundle patch: mount the plugin when the package is
+# installed as a bundle (`dsh plugin --profile <profile> add ...`).
+- insert:
+    - id: provider-hub
+      name: dsh-provider-hub

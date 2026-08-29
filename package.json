@@ -1,0 +1,66 @@
+{
+  "name": "dsh-provider-hub",
+  "version": "0.5.0",
+  "description": "DSH LLM provider hub: register gateway routes with their own settings panel, a built-in mainstream model catalog, custom User-Agent for UA-whitelisted gateways, field-level model overrides, and live model discovery. Configure in the plugin panel — no hand-editing settings.yaml.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-api-gateway"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs && tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "node test/plugin.test.mjs",
+    "check": "npm run typecheck && npm run build && npm test"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "llm",
+    "provider",
+    "user-agent",
+    "gateway"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc",
+    "@deepseek-ai/dsh-credentials": "^0.1.0-rc",
+    "@deepseek-ai/dsh-launch-environment": "^0.1.0-rc",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-launch-environment": "^0.1.0-rc",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  }
+}
