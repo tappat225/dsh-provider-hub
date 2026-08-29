@@ -117,7 +117,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
       if (st.writable === false) return fail('settings are read-only');
       const config = this.deps.current();
       const used = new Set(config.gateways.map((gw) => gw.provider));
-      let base = 'gateway';
+      let base = 'hub-gateway';
       let provider = base;
       for (let i = 1; used.has(provider); i++) provider = `${base}-${i}`;
       const gw: GatewayConfig = {

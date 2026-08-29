@@ -90,7 +90,7 @@ dsh plugin --profile web add https://github.com/tappat225/dsh-provider-hub/archi
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `provider` | `gateway`（自动去重） | 路由名（跨网关唯一，改动需重启） |
+| `provider` | `hub-gateway`（自动去重为 hub-gateway-1…） | 路由名（跨网关唯一，改动需重启；前缀 `hub-` 标识本插件，避免与其他 provider 插件路由名冲突） |
 | `displayName` | `Gateway` | 选择器显示名 |
 | `baseURL` | 空（必填） | 上游地址 |
 | `api` | `anthropic-messages` | 或 `openai-completions`（后者支持 `reasoning_effort` 透传） |
