@@ -360,6 +360,64 @@ check('runtime discover via echo', rd.ok === true && rd.models.length === 2 && r
 const ro = await runtime.saveOverrides(0, { 'glm-5.3': { contextWindow: 999999 } });
 check('runtime saveOverrides', ro.ok === true && stored.gateways[0].modelOverrides['glm-5.3'].contextWindow === 999999);
 
+// 9b. REGRESSION: the post-apply settings rebind must be visible to the
+// typert runtime. apply() captures `current` into the runtime deps; if it
+// captures the binding VALUE (the composition entry) instead of a thunk, the
+// settings page reads the entry forever ("saved but list empty") even though
+// settings.yaml holds the section and writes commit fine.
+const rebindDoc = { gateways: [{ provider: 'hub-gateway', displayName: 'hub-gateway', baseURL: '', api: 'anthropic-messages', userAgent: 'claude-cli/2.0.1 (external, cli)', apiKeyEnv: 'GATEWAY_API_KEY', apiKey: '', extraHeaders: {}, systemRole: 'system', anthropicThinking: false, enabledModels: ['glm-5.3'], modelOverrides: {}, customModels: [] }] };
+const cloneJson = (v) => JSON.parse(JSON.stringify(v));
+let rebindRevision = 0;
+let rebindWatcher = null;
+const rebindSettings = {
+  writable: true,
+  register: () => ({
+    get: () => cloneJson(rebindDoc),
+    watch: (cb) => { rebindWatcher = cb; return () => {}; },
+  }),
+  describe: () => [{ ns: 'llm-provider-hub', value: cloneJson(rebindDoc), user: cloneJson(rebindDoc), revision: rebindRevision }],
+  mutate: async (ns, ops) => {
+    for (const op of ops) {
+      const [head, idx, ...rest] = op.path;
+      if (head === 'gateways' && op.op === 'set' && rest.length === 0) rebindDoc.gateways = op.value;
+      else if (head === 'gateways' && rest.length > 0 && op.op === 'set') rebindDoc.gateways[Number(idx)][rest[0]] = op.value;
+      else if (head === 'gateways' && rest.length > 0 && op.op === 'unset') delete rebindDoc.gateways[Number(idx)][rest[0]];
+    }
+    rebindRevision += 1;
+    rebindWatcher?.(cloneJson(rebindDoc));
+  },
+};
+const rebindInjects = {};
+const rebindCtx = {
+  get: () => undefined,
+  llm: {
+    registerConfigurableProviders: () => {},
+    registerAdapter: () => {},
+    registerModelDiscovery: () => {},
+  },
+  inject: (services, cb) => { rebindInjects[services[0]] = cb; },
+  logger: { info: () => {}, warn: () => {} },
+};
+plugin.apply(rebindCtx, plugin.Config({ gateways: [] }));
+const rebindServices = {};
+const rebindTypertCtx = {
+  get: (n) => (n === 'settings' ? rebindSettings : n === 'llm' ? { listProviders: () => [], listConfigurableProviders: () => [], listModels: async () => [], resolveModelInfo: async () => ({}) } : undefined),
+  logger: { info: () => {}, warn: () => {} },
+  typert: { register: () => {} },
+  reflect: { provide: (name, value) => { rebindServices[name] = value; } },
+};
+rebindInjects['settings']({ settings: rebindSettings, effect: (fn) => { fn(); return () => {}; }, get: () => undefined });
+rebindInjects['typert'](rebindTypertCtx);
+const rebindRuntime = rebindServices.providerHub;
+check('rebind: runtime captured (providerHub service)', rebindRuntime !== undefined, String(rebindRuntime));
+const rebindState = await rebindRuntime.getState();
+check('rebind: getState sees settings doc (1 gateway, not entry 0)', rebindState.ok === true && rebindState.gateways.length === 1, JSON.stringify({ ok: rebindState.ok, gateways: rebindState.gateways?.length }));
+const rebindAdd = await rebindRuntime.addGateway();
+check('rebind: addGateway appends (2 gateways, index 1)', rebindAdd.ok === true && rebindDoc.gateways.length === 2 && rebindAdd.index === 1, JSON.stringify({ ok: rebindAdd.ok, n: rebindDoc.gateways.length, index: rebindAdd.index }));
+check('rebind: addGateway dedupes to hub-gateway-1', rebindAdd.gateway?.provider === 'hub-gateway-1', String(rebindAdd.gateway?.provider));
+const rebindState2 = await rebindRuntime.getState();
+check('rebind: getState after add sees 2 gateways', rebindState2.ok === true && rebindState2.gateways.length === 2, JSON.stringify({ gateways: rebindState2.gateways?.length }));
+
 // 7. Model discovery (echo /models) — draft request routed by baseURL
 const discovered = await registered.discovery.fn({ baseURL: 'http://127.0.0.1:18996', apiKey: 'sk-test' });
 check('discovery: 2 models', discovered.length === 2, JSON.stringify(discovered));

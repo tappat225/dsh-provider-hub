@@ -180,7 +180,11 @@ export function apply(ctx: Context, config: WireConfig) {
   };
 
   const adapter: LlmAdapter = new GatewayAdapter({
-    current,
+    // NOTE: `current` must be a thunk reading the mutable binding — the
+    // settings inject reassigns `current` AFTER this constructor captures the
+    // deps object. Passing `current` directly would freeze the composition
+    // entry forever (settings page always empty, routes never see new gateways).
+    current: () => current(),
     gatewayFor,
     resolveApiKey,
     preset: (provider: string) => presetEntries.get(provider),
@@ -215,7 +219,8 @@ export function apply(ctx: Context, config: WireConfig) {
   ctx.inject(['typert'], (typertCtx) => {
     try {
       new ProviderHubRuntime(typertCtx as never, {
-        current,
+        // Same capture trap as the adapter: pass a thunk, not the binding.
+        current: () => current(),
         resolveApiKey,
         gatewayFor,
         log: (message) => typertCtx.logger.info(`provider-hub: ${message}`),
