@@ -38,6 +38,7 @@ import { discoverModels } from './discovery.ts';
 import { ProviderHubRuntime } from './host/runtime.ts';
 import { TYPERT_MANIFEST } from './host/contract.ts';
 import type { GatewayConfig, WireConfig } from './types.ts';
+import { DEFAULT_USER_AGENT } from './types.ts';
 
 export const name = 'provider-hub';
 
@@ -54,7 +55,7 @@ export const DEFAULT_DISPLAY_NAME = 'Gateway';
 
 /** One gateway (provider route) schema — the unit of configuration. */
 const GatewaySchema = z.object({
-  /** Provider route this gateway registers (unique across gateways; change requires restart). */
+  /** Provider route this gateway registers (unique across gateways; changes apply live). */
   provider: z.string(),
   /** Display name in model pickers. */
   displayName: z.string().default(DEFAULT_DISPLAY_NAME),
@@ -62,8 +63,8 @@ const GatewaySchema = z.object({
   baseURL: z.string(),
   /** Wire protocol. */
   api: z.union(['anthropic-messages', 'openai-completions']).default('anthropic-messages'),
-  /** User-Agent sent on the wire (gateway whitelist). */
-  userAgent: z.string().default('claude-cli/2.0.1 (external, cli)'),
+  /** User-Agent sent on the wire (gateway whitelist; empty falls back to the default). */
+  userAgent: z.string().default(DEFAULT_USER_AGENT),
   /** Credential-ref env var name; resolved through the credentials service or launch environment. */
   apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV),
   /** Literal key, optional; takes precedence over apiKeyEnv. */

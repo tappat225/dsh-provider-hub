@@ -438,6 +438,22 @@ check('rebind: addGateway dedupes to hub-gateway-1', rebindAdd.gateway?.provider
 const rebindState2 = await rebindRuntime.getState();
 check('rebind: getState after add sees 2 gateways', rebindState2.ok === true && rebindState2.gateways.length === 2, JSON.stringify({ gateways: rebindState2.gateways?.length }));
 
+// 9b-2. Provider rename applies LIVE (routes are re-registered on every
+// settings commit) — the old "change requires restart" hint was stale. Also
+// guard the new collision checks: a rename onto another gateway's route name
+// or onto an empty string must be refused at write time.
+const rename = await rebindRuntime.saveConfig(1, { provider: 'renamed-gw' });
+check('rename: saveConfig ok', rename.ok === true, String(rename.error));
+check('rename: adapter routes re-synced live (no restart)', rebindLlmCalls.adapter.providers.includes('renamed-gw') && !rebindLlmCalls.adapter.providers.includes('hub-gateway-1'), JSON.stringify(rebindLlmCalls.adapter.providers));
+check('rename: configurable-provider directory re-synced live', rebindLlmCalls.directory.some((e) => e.provider === 'renamed-gw') && !rebindLlmCalls.directory.some((e) => e.provider === 'hub-gateway-1'), JSON.stringify(rebindLlmCalls.directory));
+const renameTrimmed = await rebindRuntime.saveConfig(1, { provider: '  trimmed-gw  ' });
+const renameTrimmedState = await rebindRuntime.getState();
+check('rename: provider id is trimmed before save', renameTrimmed.ok === true && renameTrimmedState.gateways?.[1]?.gateway?.provider === 'trimmed-gw', JSON.stringify(renameTrimmedState.gateways?.[1]?.gateway?.provider));
+const renameCollide = await rebindRuntime.saveConfig(1, { provider: 'hub-gateway' });
+check('rename: collision with another gateway refused', renameCollide.ok === false && /already used/.test(String(renameCollide.error)), String(renameCollide.error));
+const renameEmpty = await rebindRuntime.saveConfig(1, { provider: '  ' });
+check('rename: empty provider id refused', renameEmpty.ok === false && /must not be empty/.test(String(renameEmpty.error)), String(renameEmpty.error));
+
 // 7. Model discovery (echo /models) — draft request routed by baseURL
 const discovered = await registered.discovery.fn({ baseURL: 'http://127.0.0.1:18996', apiKey: 'sk-test' });
 check('discovery: 2 models', discovered.length === 2, JSON.stringify(discovered));

@@ -25,7 +25,7 @@ import {
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm';
 import { catalogEntryFor, reasoningMetadata, resolveModelEntries } from './catalog.ts';
-import type { GatewayConfig, WireConfig } from './types.ts';
+import { effectiveUserAgent, type GatewayConfig, type WireConfig } from './types.ts';
 import { joinEndpoint } from './url.ts';
 import { errorFinish } from './wire/sse.ts';
 import { anthropicSseToChunks, toAnthropicMessages, toAnthropicTools } from './wire/anthropic.ts';
@@ -123,7 +123,7 @@ export class GatewayAdapter extends LlmAdapter {
       return;
     }
     const headers: Record<string, string> = {
-      'user-agent': gw.userAgent,
+      'user-agent': effectiveUserAgent(gw.userAgent),
       ...gw.extraHeaders,
     };
     const baseURL = gw.baseURL.replace(/\/+$/, '');

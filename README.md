@@ -90,21 +90,19 @@ dsh plugin --profile web add https://github.com/tappat225/dsh-provider-hub/archi
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `provider` | `hub-gateway`（自动去重为 hub-gateway-1…） | 路由名（跨网关唯一，改动需重启；前缀 `hub-` 标识本插件，避免与其他 provider 插件路由名冲突） |
+| `provider` | `hub-gateway`（自动去重为 hub-gateway-1…） | 提供方 ID（跨网关唯一，改名实时生效、无需重启；重名或空名在保存时拒绝。前缀 `hub-` 标识本插件，避免与其他 provider 插件路由名冲突） |
 | `displayName` | `Gateway` | 选择器显示名 |
 | `baseURL` | 空（必填） | 上游地址 |
 | `api` | `anthropic-messages` | 或 `openai-completions`（后者支持 `reasoning_effort` 透传） |
-| `userAgent` | `claude-cli/2.0.1 (external, cli)` | wire UA（可完全自定义，每网关独立） |
+| `userAgent` | `claude-cli/2.0.1 (external, cli)` | wire UA（可完全自定义，每网关独立；留空自动回退默认值，设置页内置常见客户端 UA 预设一键填写） |
 | `apiKeyEnv` | `GATEWAY_API_KEY` | credential-ref 环境变量名 |
-| `apiKey` | 空 | 字面量 key，优先于 apiKeyEnv |
+| `apiKey` | 空 | 字面量 key，优先于 apiKeyEnv（设置页默认掩码显示，可切换明文） |
 | `extraHeaders` | `{}` | 附加请求头 |
 | `systemRole` | `system` | openai 路径系统提示词角色；`developer` 可修复只认 developer 角色的严格网关（GPT 系） |
 | `anthropicThinking` | `false` | anthropic 路径是否透传 `reasoningEffort` 为 `thinking: {type:'enabled', budget_tokens: N}`（预算按档位映射，`max_tokens` 自动抬高到 `budget+1024` 以上） |
 | `enabledModels` | `["glm-5.3"]` | 从内置目录勾选 |
 | `modelOverrides` | `{}` | 按模型 id 对内置目录做字段级参数覆盖（contextWindow/maxTokens/input/reasoningEfforts/name） |
 | `customModels` | `[]` | 自定义模型（id/name/contextWindow/maxTokens/input/reasoningEfforts） |
-| `presetFrom` | 空 | 从另一个已注册 provider 路由导入一个模型的参数（如 `{provider: "my-claude-route", model: "claude-opus-4-8"}`），启动时自动解析，免手填 |
-| `catalogSnapshot` | 空 | 上次批量启用前的目录快照（`enabledModels`/`customModels`），用于「回退」（每网关独立） |
 
 ## 内置模型目录（MODEL_CATALOG）
 
@@ -112,7 +110,7 @@ GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5
 
 ## 验证
 
-- 单测（`test/plugin.test.mjs`，全过）：Config schema（多网关）、多网关注册（`registerConfigurableProviders`/`registerAdapter` 各 2 路由）、网关隔离（`listModels` A 不含 B 的模型）、内置+自定义模型解析、`listModels`/`resolveModel`（含 UNKNOWN_MODEL 拒绝）、`prepareCall`、两种协议的 SSE→chunk 转换（文本、流式 tool_use、流式 tool_calls、reasoning_content）、模型发现字段映射、presetFrom 导入、runtime 按网关 index 的增删/快照/回退/自定义。
+- 单测（`test/plugin.test.mjs`，全过）：Config schema（多网关）、多网关注册（`registerConfigurableProviders`/`registerAdapter` 各 2 路由）、网关隔离（`listModels` A 不含 B 的模型）、内置+自定义模型解析、`listModels`/`resolveModel`（含 UNKNOWN_MODEL 拒绝）、`prepareCall`、两种协议的 SSE→chunk 转换（文本、流式 tool_use、流式 tool_calls、reasoning_content）、模型发现字段映射、runtime 按网关 index 的增删改/provider 改名实时生效（重名/空名拒绝）/自定义。
 - live（假 key）：对按 UA 白名单校验的网关，自定义 UA 生效（UA 关通过、key 关拒绝）；配真 key 即可用。
 
 ## 限制
@@ -120,4 +118,4 @@ GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5
 - `anthropic-messages` 路径默认不透传 reasoningEffort；开启 `anthropicThinking` 后按档位映射为 `thinking`（网关兼容层行为不一，默认关闭更安全）。
 - `openai-completions` 路径支持 `reasoning_effort` 透传。
 - 模型发现拉取的 `/models` 若网关也做 UA 校验，插件已带自定义 UA，可正常访问。
-- 网关路由名在启动时注册，改动需重启 DSH；多网关路由名不能重复（设置页会自动生成去重名）。
+- 网关路由名改动实时生效（保存时立即重新注册路由）；多网关路由名不能重复（设置页会自动生成去重名，重名保存被拒绝）。

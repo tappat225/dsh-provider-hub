@@ -21,7 +21,7 @@ import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type { LlmDiscoveredModel } from '@deepseek-ai/dsh-llm';
 import { MODEL_CATALOG, resolveModelEntries } from '../catalog.ts';
 import { discoverModels } from '../discovery.ts';
-import type { GatewayConfig, WireConfig } from '../types.ts';
+import { DEFAULT_USER_AGENT, type GatewayConfig, type WireConfig } from '../types.ts';
 import { joinEndpoint } from '../url.ts';
 
 /** Business envelope: every method answers `{ ok, ... }` or `{ ok: false, error }`. */
@@ -173,7 +173,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
         displayName: provider,
         baseURL: '',
         api: 'anthropic-messages',
-        userAgent: 'claude-cli/2.0.1 (external, cli)',
+        userAgent: DEFAULT_USER_AGENT,
         apiKeyEnv: 'GATEWAY_API_KEY',
         apiKey: '',
         extraHeaders: {},
@@ -221,7 +221,19 @@ export class ProviderHubRuntime extends TypertRemoteService {
       const gw = this.gatewayAt(index);
       if (gw === undefined) return fail('gateway index out of range');
       const config = this.deps.current();
-      const next = config.gateways.map((g, i) => (i === index ? ({ ...g, ...patch } as GatewayConfig) : g));
+      // Provider renames apply live (routes are re-registered on every commit),
+      // but two gateways sharing one route name would silently shadow each
+      // other in the llm registry — refuse the collision at write time.
+      let normalizedPatch = patch;
+      if (patch.provider !== undefined) {
+        const provider = typeof patch.provider === 'string' ? patch.provider.trim() : '';
+        if (provider === '') return fail('provider id must not be empty');
+        if (config.gateways.some((g, i) => i !== index && g.provider.trim() === provider)) {
+          return fail(`provider id "${provider}" is already used by another gateway`);
+        }
+        normalizedPatch = { ...patch, provider };
+      }
+      const next = config.gateways.map((g, i) => (i === index ? ({ ...g, ...normalizedPatch } as GatewayConfig) : g));
       await this.setGateways(st, next);
       return ok({ config: this.deps.current() });
     } catch (error) {

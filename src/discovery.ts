@@ -7,7 +7,7 @@
  * @module dsh-provider-hub/discovery
  */
 import { LlmError, type LlmDiscoveredModel, type LlmModelDiscoveryRequest } from '@deepseek-ai/dsh-llm';
-import type { GatewayConfig } from './types.ts';
+import { effectiveUserAgent, type GatewayConfig } from './types.ts';
 import { joinEndpoint } from './url.ts';
 
 function listingUrl(baseURL: string): string {
@@ -55,7 +55,7 @@ export async function discoverModels(
   const headers: Record<string, string> = {
     ...(gw.extraHeaders ?? {}),
     accept: 'application/json',
-    'user-agent': gw.userAgent,
+    'user-agent': effectiveUserAgent(gw.userAgent),
   };
   if (supplied !== undefined && supplied !== '') headers.authorization = `Bearer ${supplied}`;
   let response: Response;

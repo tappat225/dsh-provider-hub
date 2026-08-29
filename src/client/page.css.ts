@@ -46,6 +46,8 @@ export default `
 .phub-select-anchor:disabled { opacity: 0.5; cursor: default; }
 .phub-select-anchor-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
 .phub-select-anchor:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary); outline-offset: 2px; }
+/* Compact anchor for inline use beside an input (UA presets etc.). */
+.phub-select-compact { min-width: 0; }
 .phub-textarea { width: 100%; min-height: 72px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; box-sizing: border-box; resize: vertical; }
 .phub-textarea:focus { outline: none; border-color: var(--dsw-alias-state-business-primary); }
 
@@ -54,6 +56,8 @@ export default `
 .phub-btn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover-accent); border-color: var(--dsw-alias-interactive-bg-hover-accent); color: var(--dsw-alias-brand-primary); }
 .phub-btn:disabled { opacity: 0.5; cursor: default; }
 .phub-btn-danger:hover:not(:disabled) { color: #e06c75; border-color: #e06c75; background: var(--dsw-alias-interactive-bg-hover); }
+/* Quiet secondary action (show/hide toggles beside inputs). */
+.phub-btn-ghost { background: transparent; }
 
 /* Dashed add card (the DSH "add plugin" card recipe). */
 .phub-add-card { margin-top: 12px; display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; border: 1px dashed var(--dsw-alias-border-l2); border-radius: 12px; background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; cursor: pointer; transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease; }

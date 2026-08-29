@@ -133,6 +133,26 @@ function overrideMapWith(entry: GatewayEntry, id: string, name: string, ctx: str
   return overrides;
 }
 
+/**
+ * Common client User-Agent presets (the cc-switch-style quick picks for
+ * UA-whitelisted gateways). Selecting one only fills the editable input —
+ * presets are starting points, not constraints. The two Claude forms are
+ * wire-verified (air-outer relay + pi-ai's Claude Code identity header);
+ * others use each client's known format with a recent version.
+ */
+const UA_PRESETS: Array<{ value: string; title: string }> = [
+  { value: 'claude-cli/2.0.1 (external, cli)', title: 'Claude CLI (external)' },
+  { value: 'claude-cli/2.1.75', title: 'Claude Code 2.1.75' },
+  { value: 'codex_cli_rs/0.42.0 (Ubuntu 22.04.3 LTS; x86_64) Linux', title: 'Codex CLI' },
+  { value: 'CherryStudio/1.5.0', title: 'Cherry Studio' },
+  { value: 'Cline/3.17.8', title: 'Cline' },
+  { value: 'Roo-Code/3.20.5', title: 'Roo Code' },
+  { value: 'GeminiCLI/0.8.1', title: 'Gemini CLI' },
+  { value: 'Raycast/1.98.0', title: 'Raycast' },
+  { value: 'Chatbox/1.9.0', title: 'Chatbox' },
+  { value: 'Zed/0.192.0', title: 'Zed' },
+];
+
 // ---- Small presentational helpers (DSH settings recipe) ----
 
 interface RowProps {
@@ -211,19 +231,24 @@ function SelectMenu(props: {
   options: SelectMenuOption[];
   onChange: (next: string) => void;
   disabled?: boolean;
+  /** Slim anchor for inline use beside an input (e.g. UA presets). */
+  compact?: boolean;
+  /** Anchor text when no option is selected (defaults to "—"). */
+  placeholder?: string;
 }): ReactTypes.ReactElement {
   const [open, setOpen] = React.useState(false);
   const selected = props.options.find((o) => o.value === props.value);
   const anchor = React.createElement('button', {
     type: 'button',
-    className: 'phub-select-anchor',
+    className: props.compact === true ? 'phub-select-anchor phub-select-compact' : 'phub-select-anchor',
     disabled: props.disabled === true,
     'aria-haspopup': 'listbox',
     'aria-expanded': open,
     'aria-label': props.label,
     onClick: () => setOpen((now) => !now),
   },
-    React.createElement('span', { className: 'phub-select-anchor-text' }, selected?.title ?? (props.value.length > 0 ? props.value : '—')),
+    React.createElement('span', { className: 'phub-select-anchor-text' },
+      selected?.title ?? props.placeholder ?? (props.value.length > 0 ? props.value : '—')),
     React.createElement(IconChevronDownOutline14, { size: 12 }),
   );
   return React.createElement(Menu, {
@@ -255,6 +280,10 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   const [testing, setTesting] = React.useState(false);
   const [discovering, setDiscovering] = React.useState(false);
   const [testResult, setTestResult] = React.useState<Record<number, TestResult | null>>({});
+  // Key reveal state follows the provider identity rather than its array
+  // index. Indexes are reused after deletion, which could otherwise reveal a
+  // different provider's key when the list shifts.
+  const [showKey, setShowKey] = React.useState<Record<string, boolean>>({});
 
   const refresh = React.useCallback(async () => {
     try {
@@ -282,7 +311,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
 
   React.useEffect(() => { void refresh(); }, [refresh]);
 
-  const save = async (success = t('saved')): Promise<boolean> => {
+  const save = async (): Promise<boolean> => {
     setBusy(true);
     try {
       const selected = state.selected;
@@ -311,7 +340,8 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         setStatus({ kind: 'err', text: `${t('saveFailed')}: ${String((r as { error?: unknown }).error ?? '')}` });
         return false;
       }
-      setStatus({ kind: 'ok', text: success });
+      // Saving is intentionally silent on this page; errors remain visible.
+      setStatus(null);
       void refresh();
       return true;
     } finally {
@@ -413,10 +443,29 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         const r = await call('add-gateway', {});
         if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
         else {
-          const index = (r as unknown as { index: number }).index;
-          setStatus({ kind: 'ok', text: t('saved') });
-          void refresh();
-          setState((s) => ({ ...s, selected: index }));
+          const result = r as unknown as { index: number; gateway?: unknown };
+          const index = result.index;
+          const gateway = result.gateway;
+          // addGateway returns the complete freshly-created config. Insert it
+          // directly instead of waiting for a second get-state round-trip;
+          // that round-trip was the visible delay after clicking Add.
+          if (gateway !== null && typeof gateway === 'object' && !Array.isArray(gateway)) {
+            const entry: GatewayEntry = { index, gateway: gateway as Record<string, unknown>, models: [] };
+            setState((s) => ({
+              ...s,
+              gateways: s.gateways.some((g) => g.index === index)
+                ? s.gateways.map((g) => (g.index === index ? entry : g))
+                : [...s.gateways, entry],
+              selected: index,
+            }));
+            setOverridesText((text) => ({ ...text, [index]: JSON.stringify((entry.gateway.modelOverrides as Record<string, unknown>) ?? {}, null, 2) }));
+            setHeadersText((text) => ({ ...text, [index]: JSON.stringify((entry.gateway.extraHeaders as Record<string, unknown>) ?? {}, null, 2) }));
+          } else {
+            // Defensive fallback for older hosts that do not return the entry.
+            setState((s) => ({ ...s, selected: index }));
+            void refresh();
+          }
+          setStatus(null);
         }
       } finally {
         setBusy(false);
@@ -429,7 +478,10 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       const r = await call('delete-gateway', { index });
       if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
       else {
-        setStatus({ kind: 'ok', text: t('saved') });
+        setStatus(null);
+        // A deleted provider may be added again later with the same id; never
+        // carry a prior reveal choice into that new credential.
+        setShowKey({});
         void refresh();
         setState((s) => ({ ...s, selected: null }));
       }
@@ -444,7 +496,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       void (async () => {
         const r = await call('save-overrides', { index: selected, overrides });
         if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-        else setStatus({ kind: 'ok', text: t('saved') });
+        else setStatus(null);
       })();
     } catch {
       setStatus({ kind: 'err', text: 'modelOverrides: invalid JSON' });
@@ -603,6 +655,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   const selected = state.selected;
   const selectedEntry = state.gateways.find((g) => g.index === selected);
   const cfg = selectedEntry?.gateway ?? {};
+  const providerKey = String(cfg.provider ?? '');
   const statusLine = status === null ? null
     : React.createElement('span', { className: `phub-status phub-status-${status.kind}` }, status.text);
   // Connection-test banner for the selected gateway (null until first test;
@@ -699,8 +752,45 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
             onChange: (next) => setField('api', next),
           }),
         }),
-        fieldRow('userAgent', t('userAgent')),
-        fieldRow('apiKey', t('apiKey')),
+        // UA quick-picks: selecting a preset only fills the editable input.
+        Row({
+          title: t('userAgent'),
+          desc: t('userAgentHint'),
+          control: React.createElement(React.Fragment, null,
+            React.createElement(SelectMenu, {
+              label: t('userAgent'),
+              compact: true,
+              placeholder: t('uaPreset'),
+              value: UA_PRESETS.find((p) => p.value === String(cfg.userAgent ?? ''))?.value ?? '',
+              options: UA_PRESETS.map((p) => ({ value: p.value, title: p.title })),
+              onChange: (next) => setField('userAgent', next),
+            }),
+            React.createElement('input', {
+              className: 'phub-input',
+              value: String(cfg.userAgent ?? ''),
+              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setField('userAgent', e.target.value),
+            }),
+          ),
+        }),
+        // API key: masked by default, per-provider reveal toggle.
+        Row({
+          title: t('apiKey'),
+          control: React.createElement(React.Fragment, null,
+            React.createElement('input', {
+              className: 'phub-input',
+              type: showKey[providerKey] === true ? 'text' : 'password',
+              value: String(cfg.apiKey ?? ''),
+              autoComplete: 'off',
+              spellCheck: false,
+              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setField('apiKey', e.target.value),
+            }),
+            React.createElement('button', {
+              type: 'button',
+              className: 'phub-btn phub-btn-ghost',
+              onClick: () => setShowKey((s) => ({ ...s, [providerKey]: s[providerKey] === true ? false : true })),
+            }, showKey[providerKey] === true ? t('hide') : t('show')),
+          ),
+        }),
         fieldRow('apiKeyEnv', t('apiKeyEnv'), t('apiKeyHint')),
         Row({
           title: t('anthropicThinking'),

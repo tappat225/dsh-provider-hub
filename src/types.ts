@@ -7,6 +7,16 @@
  */
 import type { ModelModality } from '@deepseek-ai/dsh-llm';
 
+/** User-Agent used when a gateway leaves the field empty (schema default). */
+export const DEFAULT_USER_AGENT = 'claude-cli/2.0.1 (external, cli)';
+
+/** The UA actually sent on the wire: an explicitly emptied field falls back
+ * to the default (an empty header would fail UA-whitelisted gateways). */
+export function effectiveUserAgent(userAgent: string | undefined): string {
+  const value = (userAgent ?? '').trim();
+  return value === '' ? DEFAULT_USER_AGENT : value;
+}
+
 /** Reasoning-effort map from the panel: offered level -> wire spelling (`off` maps to null). */
 export type ReasoningEffortMap = Record<string, string | null>;
 
@@ -34,7 +44,7 @@ export interface CustomModel {
  * schema in `src/index.ts`; keep both in sync.
  */
 export interface GatewayConfig {
-  /** Provider route this gateway registers (unique; change requires restart). */
+  /** Provider route this gateway registers (unique; changes apply live). */
   provider: string;
   /** Display name in model pickers. */
   displayName: string;
