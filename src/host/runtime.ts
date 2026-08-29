@@ -8,13 +8,20 @@
  * `{ ok: false, error }`; the typert boundary adds its own transport
  * envelope.
  *
+ * WRITE MODEL (important): the dsh-settings `mutate` path ops only walk
+ * plain objects — array indices (`['gateways', '0', ...]`) would turn the
+ * gateways array into `{ '0': ... }` and the schema rejects it with
+ * `$gateways expected array but got [object Object]`. Every mutation
+ * therefore rewrites the WHOLE gateways array through one `['gateways']` op,
+ * computed from the live configuration.
+ *
  * @module dsh-provider-hub/host/runtime
  */
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type { LlmModelInfo, LlmDiscoveredModel, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm';
 import { MODEL_CATALOG, resolveModelEntries } from '../catalog.ts';
 import { discoverModels } from '../discovery.ts';
-import type { GatewayConfig, PresetFrom, WireConfig } from '../types.ts';
+import type { GatewayConfig, WireConfig } from '../types.ts';
 
 /** Business envelope: every method answers `{ ok, ... }` or `{ ok: false, error }`. */
 type Envelope = { ok: boolean } & Record<string, unknown>;
@@ -35,7 +42,6 @@ interface ContextLike {
 /** Settings service surface used by the runtime. */
 interface SettingsLike {
   mutate(ns: string, ops: unknown[], expectedRevision?: number): Promise<unknown>;
-  update?(ns: string, patch: Record<string, unknown>, expectedRevision?: number): Promise<unknown>;
   describe?(options?: { redactSecrets?: boolean }): Array<{ ns: string; value?: unknown; user?: unknown; revision: number }>;
   writable?: boolean;
 }
@@ -124,6 +130,11 @@ export class ProviderHubRuntime extends TypertRemoteService {
     return { committed: false };
   }
 
+  /** Replace the whole gateways array in the settings document (one flat op). */
+  private async setGateways(st: SettingsLike, gateways: GatewayConfig[]): Promise<{ revision?: number; committed: boolean }> {
+    return this.writeOps(st, [{ op: 'set', path: ['gateways'], value: gateways }]);
+  }
+
   private llm(): LlmLike | undefined {
     return this.hostCtx.get<LlmLike>('llm');
   }
@@ -131,11 +142,6 @@ export class ProviderHubRuntime extends TypertRemoteService {
   /** Gateway at index, or undefined. */
   private gatewayAt(index: number): GatewayConfig | undefined {
     return this.deps.current().gateways[index];
-  }
-
-  /** Path prefix for gateway-scoped settings ops. */
-  private path(index: number, ...rest: string[]): string[] {
-    return ['gateways', String(index), ...rest];
   }
 
   /** Full state for the settings page: gateways + per-gateway resolved models + shared catalog. */
@@ -189,9 +195,8 @@ export class ProviderHubRuntime extends TypertRemoteService {
         modelOverrides: {},
         customModels: [],
       };
-      const ops: Op[] = [{ op: 'set', path: ['gateways'], value: [...config.gateways, gw] }];
       const index = config.gateways.length;
-      const committed = await this.writeOps(st, ops);
+      const committed = await this.setGateways(st, [...config.gateways, gw]);
       const after = this.deps.current();
       const afterView = this.view();
       this.deps.log(
@@ -212,14 +217,14 @@ export class ProviderHubRuntime extends TypertRemoteService {
       const config = this.deps.current();
       if (index < 0 || index >= config.gateways.length) return fail('gateway index out of range');
       const next = config.gateways.filter((_, i) => i !== index);
-      await this.writeOps(st, [{ op: 'set', path: ['gateways'], value: next }]);
+      await this.setGateways(st, next);
       return ok({ removed: index, gateways: next.length });
     } catch (error) {
       return fail(error);
     }
   }
 
-  /** Write one or more fields of one gateway through the settings service. */
+  /** Write one or more fields of one gateway (whole-array write). */
   async saveConfig(index: number, patch: Record<string, unknown>): Promise<Envelope> {
     try {
       const st = this.settings();
@@ -227,39 +232,23 @@ export class ProviderHubRuntime extends TypertRemoteService {
       if (st.writable === false) return fail('settings are read-only');
       const gw = this.gatewayAt(index);
       if (gw === undefined) return fail('gateway index out of range');
-      const ops = Object.entries(patch).map(([key, value]) => ({ op: 'set' as const, path: this.path(index, key), value }));
-      await this.writeOps(st, ops);
+      const config = this.deps.current();
+      const next = config.gateways.map((g, i) => (i === index ? ({ ...g, ...patch } as GatewayConfig) : g));
+      await this.setGateways(st, next);
       return ok({ config: this.deps.current() });
     } catch (error) {
       return fail(error);
     }
   }
 
-  /** Enable/disable a built-in catalog model id on one gateway. Auto-snapshots before a toggle-off that would clear the last enabled model. */
+  /** Enable/disable a built-in catalog model id on one gateway. */
   async toggleBuiltin(index: number, id: string, enabled: boolean): Promise<Envelope> {
     try {
       const gw = this.gatewayAt(index);
       if (gw === undefined) return fail('gateway index out of range');
       const set = new Set(gw.enabledModels ?? []);
       if (enabled) set.add(id);
-      else {
-        // Snapshot before clearing the last enabled model so it can be restored.
-        if (set.size === 1 && set.has(id)) {
-          const existingSnapshot = gw.catalogSnapshot;
-          if (existingSnapshot === undefined || existingSnapshot.enabledModels.length === 0) {
-            const st = this.settings();
-            if (st !== undefined) {
-              await this.writeOps(st, [{
-                op: 'set', path: this.path(index, 'catalogSnapshot'), value: {
-                  enabledModels: [...(gw.enabledModels ?? [])],
-                  customModels: [...(gw.customModels ?? [])],
-                },
-              }]);
-            }
-          }
-        }
-        set.delete(id);
-      }
+      else set.delete(id);
       return this.saveConfig(index, { enabledModels: [...set] });
     } catch (error) {
       return fail(error);
@@ -280,7 +269,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
     try {
       const gw = this.gatewayAt(index);
       if (gw === undefined) return fail('gateway index out of range');
-      const custom = (gw.customModels ?? []) as unknown as Array<Record<string, unknown>>;
+      const custom = [...(gw.customModels ?? [])] as unknown as Array<Record<string, unknown>>;
       const id = typeof entry.id === 'string' && entry.id.trim() !== '' ? entry.id.trim() : undefined;
       if (id === undefined) return fail('custom model needs a non-empty id');
       const prevId = originalId !== null && typeof (originalId as { id?: unknown }).id === 'string'
@@ -308,16 +297,23 @@ export class ProviderHubRuntime extends TypertRemoteService {
   }
 
   /** Set or clear the presetFrom import on one gateway. */
-  async setPresetFrom(index: number, preset: PresetFrom | null): Promise<Envelope> {
+  async setPresetFrom(index: number, preset: { provider: string; model: string } | null): Promise<Envelope> {
     try {
       const st = this.settings();
       if (st === undefined) return fail('settings service unavailable');
       const gw = this.gatewayAt(index);
       if (gw === undefined) return fail('gateway index out of range');
-      const ops = preset === null
-        ? [{ op: 'unset', path: this.path(index, 'presetFrom') }]
-        : [{ op: 'set', path: this.path(index, 'presetFrom'), value: preset }];
-      await this.writeOps(st, ops as Op[]);
+      const config = this.deps.current();
+      const next = config.gateways.map((g, i) => {
+        if (i !== index) return g;
+        if (preset === null) {
+          const copy = { ...g };
+          delete (copy as { presetFrom?: unknown }).presetFrom;
+          return copy;
+        }
+        return { ...g, presetFrom: preset };
+      });
+      await this.setGateways(st, next);
       return ok({});
     } catch (error) {
       return fail(error);
@@ -385,50 +381,11 @@ export class ProviderHubRuntime extends TypertRemoteService {
     }
   }
 
-  /** Snapshot current catalog state (enabledModels + customModels) of one gateway. */
-  async snapshotCatalog(index: number): Promise<Envelope> {
-    try {
-      const st = this.settings();
-      if (st === undefined) return fail('settings service unavailable');
-      const gw = this.gatewayAt(index);
-      if (gw === undefined) return fail('gateway index out of range');
-      const snapshot = {
-        enabledModels: [...(gw.enabledModels ?? [])],
-        customModels: [...(gw.customModels ?? [])],
-      };
-      await this.writeOps(st, [{ op: 'set', path: this.path(index, 'catalogSnapshot'), value: snapshot }]);
-      return ok({ snapshot });
-    } catch (error) {
-      return fail(error);
-    }
-  }
-
-  /** Restore the last catalog snapshot (if any) of one gateway. */
-  async restoreCatalog(index: number): Promise<Envelope> {
-    try {
-      const st = this.settings();
-      if (st === undefined) return fail('settings service unavailable');
-      const gw = this.gatewayAt(index);
-      if (gw === undefined) return fail('gateway index out of range');
-      const snapshot = gw.catalogSnapshot;
-      if (snapshot === undefined || (snapshot.enabledModels.length === 0 && snapshot.customModels.length === 0)) {
-        return fail('no catalog snapshot to restore');
-      }
-      await this.writeOps(st, [
-        { op: 'set', path: this.path(index, 'enabledModels'), value: snapshot.enabledModels },
-        { op: 'set', path: this.path(index, 'customModels'), value: snapshot.customModels },
-      ]);
-      return ok({ restored: snapshot });
-    } catch (error) {
-      return fail(error);
-    }
-  }
-
   /**
-   * Enable one discovered model on one gateway directly: if the id hits the
-   * built-in catalog, enable it in `enabledModels`; otherwise insert it as a
-   * custom model. Takes a snapshot before the first enable of a session so
-   * bulk enables can be rolled back when they clear the catalog.
+   * Enable one model on one gateway: if the id hits the built-in catalog,
+   * enable it in `enabledModels` (discovery/preset params richer than the
+   * catalog seed an override); otherwise insert it as a custom model. One
+   * whole-array write.
    */
   async enableDiscovered(index: number, model: Record<string, unknown>): Promise<Envelope> {
     try {
@@ -437,51 +394,45 @@ export class ProviderHubRuntime extends TypertRemoteService {
       const gw = this.gatewayAt(index);
       if (gw === undefined) return fail('gateway index out of range');
       const id = typeof model.id === 'string' ? model.id.trim() : '';
-      if (id === '') return fail('discovered model needs a non-empty id');
-      // Snapshot before first mutation of this session (idempotent guard: only when absent or empty).
-      const existingSnapshot = gw.catalogSnapshot;
-      const shouldSnapshot = existingSnapshot === undefined
-        || (existingSnapshot.enabledModels.length === 0 && existingSnapshot.customModels.length === 0);
-      if (shouldSnapshot) {
-        await this.writeOps(st, [{
-          op: 'set', path: this.path(index, 'catalogSnapshot'), value: {
-            enabledModels: [...(gw.enabledModels ?? [])],
-            customModels: [...(gw.customModels ?? [])],
-          },
-        }]);
-      }
+      if (id === '') return fail('model needs a non-empty id');
+      let next: GatewayConfig;
+      let kind: string;
       if (MODEL_CATALOG[id] !== undefined) {
-        // Built-in: enable it (and optionally seed override from discovery params).
+        // Built-in: enable it (optionally seeding an override from parameters).
         const set = new Set(gw.enabledModels ?? []);
         set.add(id);
-        const ops: unknown[] = [{ op: 'set', path: this.path(index, 'enabledModels'), value: [...set] }];
-        // If discovery supplied richer params than catalog, seed an override.
+        const patch: Record<string, unknown> = { enabledModels: [...set] };
         const discoveredCtx = typeof model.contextWindow === 'number' && Number.isFinite(model.contextWindow) ? model.contextWindow as number : undefined;
         const discoveredMax = typeof model.maxTokens === 'number' && Number.isFinite(model.maxTokens) ? model.maxTokens as number : undefined;
         if (discoveredCtx !== undefined || discoveredMax !== undefined) {
           const overrides = { ...(gw.modelOverrides ?? {}) } as Record<string, Record<string, unknown>>;
           const cur = overrides[id] ?? {};
-          const next: Record<string, unknown> = { ...cur };
-          if (discoveredCtx !== undefined) next.contextWindow = discoveredCtx;
-          if (discoveredMax !== undefined) next.maxTokens = discoveredMax;
-          overrides[id] = next;
-          ops.push({ op: 'set', path: this.path(index, 'modelOverrides'), value: overrides });
+          const nextOv: Record<string, unknown> = { ...cur };
+          if (discoveredCtx !== undefined) nextOv.contextWindow = discoveredCtx;
+          if (discoveredMax !== undefined) nextOv.maxTokens = discoveredMax;
+          overrides[id] = nextOv;
+          patch.modelOverrides = overrides;
         }
-        await this.writeOps(st, ops as Op[]);
-        return ok({ enabled: id, kind: 'builtin' });
+        next = { ...gw, ...patch };
+        kind = 'builtin';
+      } else {
+        // Non-catalog: insert as custom model.
+        const custom = [...(gw.customModels ?? [])] as unknown as Array<Record<string, unknown>>;
+        if (custom.some((item) => item.id === id)) return ok({ enabled: id, kind: 'custom-existing' });
+        const entry: Record<string, unknown> = {
+          id,
+          name: typeof model.name === 'string' && model.name.trim() !== '' ? model.name : id,
+          contextWindow: typeof model.contextWindow === 'number' && Number.isFinite(model.contextWindow) ? model.contextWindow : 128000,
+          maxTokens: typeof model.maxTokens === 'number' && Number.isFinite(model.maxTokens) ? model.maxTokens : 8192,
+        };
+        custom.push(entry);
+        next = { ...gw, customModels: custom as unknown as typeof gw.customModels };
+        kind = 'custom';
       }
-      // Non-catalog: insert as custom model.
-      const custom = [...(gw.customModels ?? [])] as unknown as Array<Record<string, unknown>>;
-      if (custom.some((item) => item.id === id)) return ok({ enabled: id, kind: 'custom-existing' });
-      const entry: Record<string, unknown> = {
-        id,
-        name: typeof model.name === 'string' && model.name.trim() !== '' ? model.name : id,
-        contextWindow: typeof model.contextWindow === 'number' && Number.isFinite(model.contextWindow) ? model.contextWindow : 128000,
-        maxTokens: typeof model.maxTokens === 'number' && Number.isFinite(model.maxTokens) ? model.maxTokens : 8192,
-      };
-      custom.push(entry);
-      await this.writeOps(st, [{ op: 'set', path: this.path(index, 'customModels'), value: custom }]);
-      return ok({ enabled: id, kind: 'custom' });
+      const config = this.deps.current();
+      const gws = config.gateways.map((g, i) => (i === index ? next : g));
+      await this.setGateways(st, gws);
+      return ok({ enabled: id, kind });
     } catch (error) {
       return fail(error);
     }

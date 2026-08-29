@@ -98,18 +98,6 @@ const GatewaySchema = z.object({
     provider: z.string(),
     model: z.string(),
   }),
-  /** Snapshot of catalog state before the last bulk enable (for rollback). */
-  catalogSnapshot: z.object({
-    enabledModels: z.array(z.string()).default([]),
-    customModels: z.array(z.object({
-      id: z.string(),
-      name: z.string(),
-      contextWindow: z.number().step(1).min(1),
-      maxTokens: z.number().step(1).min(1),
-      input: z.array(z.union(['text', 'image', 'audio'])).default(['text']),
-      reasoningEfforts: z.dict(z.union([z.string(), z.const(null)])),
-    })).default([]),
-  }),
 });
 
 /** Config schema rendered as the plugin settings panel: a list of gateways. */

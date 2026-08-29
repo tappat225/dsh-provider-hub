@@ -396,23 +396,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     }
   };
 
-  const adoptDiscovered = async (model: DiscoveredModel) => {
-    const selected = state.selected;
-    if (selected === null) return;
-    const entry: Record<string, unknown> = {
-      id: model.id,
-      name: model.name ?? model.id,
-      contextWindow: model.contextWindow,
-      maxTokens: model.maxTokens,
-    };
-    const r = await call('upsert-custom', { index: selected, entry, originalId: null });
-    if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-    else {
-      setStatus({ kind: 'ok', text: `${model.id} ✓` });
-      void refresh();
-    }
-  };
-
   const enableDiscovered = async (model: DiscoveredModel) => {
     const selected = state.selected;
     if (selected === null) return;
@@ -420,25 +403,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
     else {
       setStatus({ kind: 'ok', text: `${model.id} ${t('enable')} ✓` });
-      void refresh();
-    }
-  };
-
-  const snapshotCatalog = async () => {
-    const selected = state.selected;
-    if (selected === null) return;
-    const r = await call('snapshot-catalog', { index: selected });
-    if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-    else setStatus({ kind: 'ok', text: `${t('snapshot')} ✓` });
-  };
-
-  const restoreCatalog = async () => {
-    const selected = state.selected;
-    if (selected === null) return;
-    const r = await call('restore-catalog', { index: selected });
-    if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-    else {
-      setStatus({ kind: 'ok', text: `${t('restore')} ✓` });
       void refresh();
     }
   };
@@ -684,11 +648,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
           React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void runDiscover() }, t('discover')),
           React.createElement('span', { className: 'phub-editor-note' }, t('discoverHint')),
         ),
-        React.createElement('div', { className: 'phub-actions' },
-          React.createElement('button', { className: 'phub-btn', onClick: () => void snapshotCatalog() }, t('snapshot')),
-          React.createElement('button', { className: 'phub-btn', onClick: () => void restoreCatalog() }, t('restore')),
-          React.createElement('span', { className: 'phub-editor-note' }, t('snapshotHint')),
-        ),
         discovered[selected] === null || discovered[selected] === undefined ? null
           : React.createElement('div', { className: 'phub-discover-list' },
             (discovered[selected] ?? []).map((model) => React.createElement('div', { className: 'phub-discover-item', key: model.id },
@@ -696,7 +655,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
                 `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}`,
               ),
               React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
-              React.createElement('button', { className: 'phub-btn', onClick: () => void adoptDiscovered(model) }, t('adopt')),
             )),
           ),
       ),

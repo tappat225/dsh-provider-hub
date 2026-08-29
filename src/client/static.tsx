@@ -49,8 +49,6 @@ const METHOD_MAP: Record<string, string> = {
   'preset-model-info': 'presetModelInfo',
   'discover': 'discover',
   'enable-discovered': 'enableDiscovered',
-  'snapshot-catalog': 'snapshotCatalog',
-  'restore-catalog': 'restoreCatalog',
 };
 
 /** Wire method name → positional argument order on the Remote handle. */
@@ -66,8 +64,6 @@ const PARAM_ORDER: Record<string, string[]> = {
   'preset-model-info': ['provider', 'model'],
   'discover': ['index'],
   'enable-discovered': ['index', 'model'],
-  'snapshot-catalog': ['index'],
-  'restore-catalog': ['index'],
 };
 
 function adoptStyles(): void {

@@ -37,12 +37,6 @@ export interface PresetFrom {
   model: string;
 }
 
-/** Snapshot of the catalog state before a bulk discovery-enable operation (for rollback). */
-export interface CatalogSnapshot {
-  enabledModels: string[];
-  customModels: CustomModel[];
-}
-
 /**
  * One gateway (provider route) configuration. Mirrors the per-gateway object
  * schema in `src/index.ts`; keep both in sync.
@@ -76,8 +70,6 @@ export interface GatewayConfig {
   customModels: CustomModel[];
   /** Import one model's capability parameters from another registered provider route. */
   presetFrom?: PresetFrom;
-  /** Last snapshot taken before a discovery-enable or bulk toggle (for restore). */
-  catalogSnapshot?: CatalogSnapshot;
 }
 
 /**

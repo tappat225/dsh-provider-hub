@@ -95,8 +95,6 @@ export const METHODS = {
   presetModelInfo: 'preset-model-info',
   discover: 'discover',
   enableDiscovered: 'enable-discovered',
-  snapshotCatalog: 'snapshot-catalog',
-  restoreCatalog: 'restore-catalog',
 } as const;
 
 const invocation = (id: string, method: string, parameters: unknown[]) => ({
@@ -124,8 +122,6 @@ export const INVOCATIONS = [
   invocation('presetModelInfo', 'presetModelInfo', [stringParam('provider'), stringParam('model')]),
   invocation('discover', 'discover', [numberParam('index')]),
   invocation('enableDiscovered', 'enableDiscovered', [numberParam('index'), objectParam('model')]),
-  invocation('snapshotCatalog', 'snapshotCatalog', [numberParam('index')]),
-  invocation('restoreCatalog', 'restoreCatalog', [numberParam('index')]),
 ];
 
 /** Host manifest registered through `ctx.typert.register`. */
@@ -155,8 +151,6 @@ export const TYPERT_MANIFEST = {
           { kind: 'method', name: 'presetModelInfo', signature: 'presetModelInfo(provider: string, model: string): Promise<object>' },
           { kind: 'method', name: 'discover', signature: 'discover(index: number): Promise<object>' },
           { kind: 'method', name: 'enableDiscovered', signature: 'enableDiscovered(index: number, model: object): Promise<object>' },
-          { kind: 'method', name: 'snapshotCatalog', signature: 'snapshotCatalog(index: number): Promise<object>' },
-          { kind: 'method', name: 'restoreCatalog', signature: 'restoreCatalog(index: number): Promise<object>' },
         ],
         types: [],
       },
