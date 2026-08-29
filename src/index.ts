@@ -191,28 +191,34 @@ export function apply(ctx: Context, config: WireConfig) {
       settingsPath: [],
     })));
     ctx.llm.registerAdapter(providers, adapter);
+    ctx.llm.registerModelDiscovery(NS, (request) => {
+      // The discovery request is a draft (baseURL/apiKey), not a stored route:
+      // find the gateway whose baseURL matches, else fall back to the first.
+      const gw = current().gateways.find((g) => {
+        const base = g.baseURL?.replace(/\/+$/, '');
+        const want = request.baseURL?.replace(/\/+$/, '');
+        return base !== undefined && want !== undefined && base === want;
+      }) ?? current().gateways[0];
+      if (gw === undefined) {
+        throw new LlmError('llm-provider-hub: model discovery needs a gateway with a baseURL; add one in the plugin settings', 'DISCOVERY_FAILED');
+      }
+      return discoverModels(request, gw, () => resolveApiKey(gw));
+    });
   }
-  ctx.llm.registerModelDiscovery(NS, (request) => {
-    // The discovery request is a draft (baseURL/apiKey), not a stored route:
-    // find the gateway whose baseURL matches, else fall back to the first.
-    const gw = current().gateways.find((g) => {
-      const base = g.baseURL?.replace(/\/+$/, '');
-      const want = request.baseURL?.replace(/\/+$/, '');
-      return base !== undefined && want !== undefined && base === want;
-    }) ?? current().gateways[0];
-    if (gw === undefined) {
-      throw new LlmError('llm-provider-hub: model discovery needs a gateway with a baseURL; add one in the plugin settings', 'DISCOVERY_FAILED');
-    }
-    return discoverModels(request, gw, () => resolveApiKey(gw));
-  });
 
   // Client-half remote service: the settings page (lib/client.js) manages
   // the same configuration through this namespace.
   ctx.inject(['typert'], (typertCtx) => {
-    new ProviderHubRuntime(typertCtx as never, { current, resolveApiKey, gatewayFor });
-    // Mirror the official dsh-typert-loader pattern: ctx.typert.register(manifest)
-    // (keeps `this` bound — destructuring the method would crash the loader).
-    (typertCtx.typert as unknown as { register(manifest: unknown): unknown }).register(TYPERT_MANIFEST);
+    try {
+      new ProviderHubRuntime(typertCtx as never, { current, resolveApiKey, gatewayFor });
+      // Mirror the official dsh-typert-loader pattern: ctx.typert.register(manifest)
+      // (keeps `this` bound — destructuring the method would crash the loader).
+      (typertCtx.typert as unknown as { register(manifest: unknown): unknown }).register(TYPERT_MANIFEST);
+    } catch (error) {
+      // Never let the Remote service or typert registration take down the
+      // plugin tree: the provider routes still work without the settings page.
+      ctx.logger.warn(`provider-hub: typert/Remote setup failed (settings page unavailable): ${error instanceof Error ? error.message : String(error)}`);
+    }
   });
 
   installSettingsSection(ctx, NS, Config, config, {
