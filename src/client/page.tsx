@@ -60,6 +60,79 @@ interface TestResult {
   error?: string;
 }
 
+/** In-progress edit of one enabled model: `custom` models update their entry,
+ * built-in catalog ids update their per-model override. */
+interface EditTarget {
+  id: string;
+  custom: boolean;
+}
+
+function tokenize(value: string): string[] {
+  return value.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length > 0);
+}
+
+/** Longest run of consecutive shared tokens ("claude-opus-4-5-20260101" vs
+ * "claude-opus-4-8" shares [claude, opus, 4]). */
+function sharedTokenRun(a: string[], b: string[]): number {
+  let best = 0;
+  for (let i = 0; i < a.length; i++) {
+    for (let j = 0; j < b.length; j++) {
+      let run = 0;
+      while (i + run < a.length && j + run < b.length && a[i + run] === b[j + run]) run++;
+      if (run > best) best = run;
+    }
+  }
+  return best;
+}
+
+/**
+ * Best built-in catalog hit for a model id (case-insensitive): exact match
+ * first, then prefix / token-run matching so gateway spellings like
+ * "deepseek-v3.2-exp" or "claude-opus-4-5-20260101" still find their preset.
+ * Drives the contextual "use preset parameters" button; no hit = no button.
+ */
+function matchCatalog(id: string, catalog: State['catalog']): string | undefined {
+  const key = id.trim().toLowerCase();
+  if (key === '') return undefined;
+  if (catalog[key] !== undefined) return key;
+  const keyTokens = tokenize(key);
+  let best: string | undefined;
+  let bestScore = 0;
+  for (const catId of Object.keys(catalog)) {
+    const lower = catId.toLowerCase();
+    let score = 0;
+    // Typed id extends a catalog id ("deepseek-v3.2-exp" ⊃ "deepseek-v3").
+    if (key.startsWith(lower)) score = 2 + lower.length;
+    // Typed id is a meaningful prefix of a catalog id ("gpt-5" ⊂ "gpt-5.6-*").
+    else if (lower.startsWith(key) && key.length >= 5) score = 1 + key.length;
+    else {
+      // Family match across version/date suffixes.
+      const catTokens = tokenize(catId);
+      const run = sharedTokenRun(keyTokens, catTokens);
+      if (run >= 2 && run / catTokens.length >= 0.5) score = 1 + run;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = catId;
+    }
+  }
+  return best;
+}
+
+/** Whole modelOverrides map after editing one built-in model: non-empty form
+ * fields become that id's override; an all-empty edit drops it, so the
+ * catalog defaults apply again. */
+function overrideMapWith(entry: GatewayEntry, id: string, name: string, ctx: string, max: string): Record<string, unknown> {
+  const overrides: Record<string, Record<string, unknown>> = { ...((entry.gateway.modelOverrides as Record<string, Record<string, unknown>>) ?? {}) };
+  const next: Record<string, unknown> = {};
+  if (name !== '') next.name = name;
+  if (ctx !== '' && Number(ctx) > 0) next.contextWindow = Number(ctx);
+  if (max !== '' && Number(max) > 0) next.maxTokens = Number(max);
+  if (Object.keys(next).length === 0) delete overrides[id];
+  else overrides[id] = next;
+  return overrides;
+}
+
 // ---- Small presentational helpers (DSH settings recipe) ----
 
 interface RowProps {
@@ -150,7 +223,7 @@ function SelectMenu(props: {
     'aria-label': props.label,
     onClick: () => setOpen((now) => !now),
   },
-    React.createElement('span', { className: 'phub-select-anchor-text' }, selected?.title ?? props.value ?? '—'),
+    React.createElement('span', { className: 'phub-select-anchor-text' }, selected?.title ?? (props.value.length > 0 ? props.value : '—')),
     React.createElement(IconChevronDownOutline14, { size: 12 }),
   );
   return React.createElement(Menu, {
@@ -174,7 +247,8 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   const [busy, setBusy] = React.useState(false);
   const [addModelDraft, setAddModelDraft] = React.useState<{ id: string; name: string; contextWindow: string; maxTokens: string }>(
     { id: '', name: '', contextWindow: '', maxTokens: '' });
-  const [presetPick, setPresetPick] = React.useState('');
+  const [fetchedPick, setFetchedPick] = React.useState('');
+  const [editing, setEditing] = React.useState<EditTarget | null>(null);
   const [overridesText, setOverridesText] = React.useState<Record<number, string>>({});
   const [headersText, setHeadersText] = React.useState<Record<number, string>>({});
   const [discovered, setDiscovered] = React.useState<Record<number, DiscoveredModel[] | null>>({});
@@ -377,33 +451,84 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     }
   };
 
-  /**
-   * Add one model: ids matching the built-in catalog are enabled as catalog
-   * entries (params auto-filled; non-default inputs become field overrides);
-   * anything else is stored as a custom model with the given (or default)
-   * params. Backed by the runtime's enableDiscovered.
-   */
-  const submitAddModel = () => {
+  /** Fill the form from one enabled model and switch it to edit mode. */
+  const startEdit = (id: string) => {
     const selected = state.selected;
     if (selected === null) return;
+    const entry = state.gateways.find((g) => g.index === selected);
+    const model = (entry?.models ?? []).find((m) => String(m.id) === id);
+    if (model === undefined) return;
+    setEditing({ id, custom: state.catalog[id] === undefined });
+    setFetchedPick('');
+    setAddModelDraft({
+      id,
+      name: String(model.name ?? '') === id ? '' : String(model.name ?? ''),
+      contextWindow: model.contextWindow === undefined ? '' : String(model.contextWindow),
+      maxTokens: model.maxTokens === undefined ? '' : String(model.maxTokens),
+    });
+  };
+
+  /** Leave edit mode and clear the form. */
+  const cancelEdit = () => {
+    setEditing(null);
+    setAddModelDraft({ id: '', name: '', contextWindow: '', maxTokens: '' });
+  };
+
+  /**
+   * Submit the add/edit form. New models: ids matching the built-in catalog
+   * are enabled as catalog entries (explicit params become field overrides);
+   * anything else is stored as a custom model (runtime enableDiscovered).
+   * Edits: custom models rewrite their entry (upsert-custom); built-in ids
+   * rewrite only their per-model override via a whole-map save (an empty
+   * field drops that override and falls back to the catalog default).
+   */
+  const submitModelForm = () => {
+    const selected = state.selected;
+    if (selected === null) return;
+    const entry = state.gateways.find((g) => g.index === selected);
+    if (entry === undefined) return;
     const id = addModelDraft.id.trim();
+    const name = addModelDraft.name.trim();
+    const ctx = addModelDraft.contextWindow.trim();
+    const max = addModelDraft.maxTokens.trim();
+    if (editing !== null) {
+      void (async () => {
+        const r = editing.custom
+          ? await call('upsert-custom', {
+            index: selected,
+            // Omitted fields keep their previous value (partial update).
+            entry: { id: editing.id, ...(name === '' ? {} : { name }), ...(ctx === '' ? {} : { contextWindow: Number(ctx) || undefined }), ...(max === '' ? {} : { maxTokens: Number(max) || undefined }) },
+            originalId: { id: editing.id },
+          })
+          : await call('save-config', {
+            index: selected,
+            patch: { modelOverrides: overrideMapWith(entry, editing.id, name, ctx, max) },
+          });
+        if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
+        else {
+          setStatus({ kind: 'ok', text: `${editing.id} ✓` });
+          cancelEdit();
+          void refresh();
+        }
+      })();
+      return;
+    }
     if (id === '') {
       setStatus({ kind: 'err', text: t('modelId') + ' ' + t('required') });
       return;
     }
     void (async () => {
-      const entry: Record<string, unknown> = {
+      const model: Record<string, unknown> = {
         id,
-        ...(addModelDraft.name.trim() === '' ? {} : { name: addModelDraft.name.trim() }),
-        ...(addModelDraft.contextWindow.trim() === '' ? {} : { contextWindow: Number(addModelDraft.contextWindow) || undefined }),
-        ...(addModelDraft.maxTokens.trim() === '' ? {} : { maxTokens: Number(addModelDraft.maxTokens) || undefined }),
+        ...(name === '' ? {} : { name }),
+        ...(ctx === '' ? {} : { contextWindow: Number(ctx) || undefined }),
+        ...(max === '' ? {} : { maxTokens: Number(max) || undefined }),
       };
-      const r = await call('enable-discovered', { index: selected, model: entry });
+      const r = await call('enable-discovered', { index: selected, model });
       if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
       else {
         setStatus({ kind: 'ok', text: `${id} ${t('enable')} ✓` });
         setAddModelDraft({ id: '', name: '', contextWindow: '', maxTokens: '' });
-        setPresetPick('');
         void refresh();
       }
     })();
@@ -451,22 +576,11 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         const modelsRaw = (r as { models?: unknown }).models;
         const models = Array.isArray(modelsRaw) ? modelsRaw as DiscoveredModel[] : [];
         setDiscovered((d) => ({ ...d, [selected]: models }));
-        setStatus({ kind: 'ok', text: t('discovered') });
+        setStatus({ kind: 'ok', text: `${models.length} ${t('testModels')}` });
       } finally {
         setDiscovering(false);
       }
     })();
-  };
-
-  const enableDiscovered = async (model: DiscoveredModel) => {
-    const selected = state.selected;
-    if (selected === null) return;
-    const r = await call('enable-discovered', { index: selected, model: model as unknown as Record<string, unknown> });
-    if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-    else {
-      setStatus({ kind: 'ok', text: `${model.id} ${t('enable')} ✓` });
-      void refresh();
-    }
   };
 
   /** One editor field as a settings row (title/desc left, input right). */
@@ -508,8 +622,12 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
             : ''}`
         : String(test.error ?? '')),
   );
-  // Model ids already enabled on the selected gateway (marks discovered rows).
+  // Model ids already enabled on the selected gateway (marks fetched options).
   const enabledIds = new Set((selectedEntry?.models ?? []).map((m) => String(m.id)));
+  // Contextual preset hit for whatever id is currently in the add form.
+  const presetHit = matchCatalog(addModelDraft.id, state.catalog);
+  // The fetched (or test-probed) model listing, when one exists.
+  const fetchedList = selected === null ? undefined : discovered[selected];
 
   return React.createElement('div', { className: 'phub-page' },
     React.createElement('p', { className: 'phub-intro' }, t('intro')),
@@ -567,7 +685,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       React.createElement('div', { className: 'phub-group' },
         fieldRow('provider', t('providerName'), t('providerNameHint')),
         fieldRow('displayName', t('displayName')),
-        fieldRow('baseURL', `${t('baseURL')} *`, undefined, t('baseURLPlaceholder')),
+        fieldRow('baseURL', `${t('baseURL')} *`, t('baseURLHint'), t('baseURLPlaceholder')),
         Row({
           title: t('api'),
           // MUST be a React element (createElement), never a direct call:
@@ -619,7 +737,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     ),
 
     // ---- Models ----
-    // Stable reading order: enabled list → discover → add → overrides.
+    // Stable reading order: enabled list (editable) → add form → overrides.
     selected === null || selectedEntry === undefined ? null : React.createElement('section', null,
       React.createElement('div', { className: 'phub-group-heading' },
         t('models'),
@@ -628,7 +746,8 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         ),
       ),
       React.createElement('div', { className: 'phub-group' },
-        // -- Enabled models (catalog entries + custom models), each removable.
+        // -- Enabled models (catalog entries + custom models): edit fills the
+        //    form below, remove deletes.
         SubHead(t('modelsEnabled')),
         React.createElement('div', { className: 'phub-models-list' },
           (selectedEntry.models ?? []).length === 0
@@ -638,76 +757,74 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
               const name = String(m.name ?? id);
               const ctx = String(m.contextWindow ?? '');
               const max = String(m.maxTokens ?? '');
+              const active = editing?.id === id;
               return Row({
                 key: id,
+                className: active ? 'phub-row-selected' : undefined,
                 title: name,
                 desc: React.createElement('span', { className: 'phub-model-params' },
                   `${id}${ctx === '' ? '' : ` · ${ctx}`}${max === '' ? '' : ` · ${max}`}${
                     state.catalog[id] !== undefined ? '' : ` · ${t('custom')}`}`,
                 ),
-                control: React.createElement('button', {
-                  className: 'phub-btn phub-btn-danger',
-                  title: t('remove'),
-                  onClick: () => void removeModel(id),
-                }, t('remove')),
+                control: React.createElement(React.Fragment, null,
+                  React.createElement('button', {
+                    className: 'phub-btn',
+                    title: t('edit'),
+                    onClick: () => startEdit(id),
+                  }, t('edit')),
+                  React.createElement('button', {
+                    className: 'phub-btn phub-btn-danger',
+                    title: t('remove'),
+                    onClick: () => void removeModel(id),
+                  }, t('remove')),
+                ),
               });
             }),
         ),
-        // -- Discover: pull the upstream listing (with the current form
-        //    values) and enable models in one click.
-        SubHead(t('discover'), t('discoverHint')),
+        // -- Add: fetch the upstream listing into a dropdown (with the current
+        //    form values), pick or type an id, optionally apply preset params.
+        SubHead(editing === null ? t('addModel') : `${t('addModel')} · ${t('edit')}: ${editing.id}`, t('addModelHint')),
         React.createElement('div', { className: 'phub-actions', style: { paddingTop: 0 } },
           React.createElement('button', {
             className: 'phub-btn',
             disabled: discovering || String(cfg.baseURL ?? '').trim() === '',
             onClick: runFetchModels,
           }, discovering ? `${t('discoverRun')}…` : t('discoverRun')),
+          fetchedList !== undefined && fetchedList !== null
+            ? React.createElement('span', { className: 'phub-editor-note' }, `${fetchedList.length} ${t('testModels')}`)
+            : null,
         ),
-        discovered[selected] === null || discovered[selected] === undefined ? null
-          : React.createElement('div', { className: 'phub-discover-list' },
-            (discovered[selected] ?? []).length === 0
-              ? React.createElement('span', { className: 'phub-editor-note', style: { padding: '4px 0' } }, `${t('discovered')}: ${t('empty')}`)
-              : (discovered[selected] ?? []).map((model) => React.createElement('div', { className: 'phub-discover-item', key: model.id },
-                React.createElement('span', null,
-                  `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}`,
-                ),
-                enabledIds.has(model.id)
-                  ? React.createElement('span', { className: 'phub-mark' }, t('alreadyEnabled'))
-                  : React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
-              )),
-          ),
-        // -- Add: built-in preset dropdown fills the manual form below.
-        SubHead(t('addModel'), t('addModelHint')),
-        Row({
-          title: t('builtinPreset'),
-          desc: t('presetHint'),
-          control: React.createElement(SelectMenu, {
-            label: t('builtinPreset'),
-            value: presetPick,
-            options: [
-              { value: '', title: '—' },
-              ...Object.entries(state.catalog).sort(([a], [b]) => a.localeCompare(b)).map(([id, entry]) => ({
-                value: id,
-                title: `${entry.name} · ${id}`,
+        // Dropdown over the fetched listing — the normal flow: fetch, pick, add.
+        fetchedList === null || fetchedList === undefined || fetchedList.length === 0 ? null
+          : Row({
+            title: t('fetchedModels'),
+            control: React.createElement(SelectMenu, {
+              label: t('fetchedModels'),
+              value: fetchedPick,
+              options: fetchedList.map((model) => ({
+                value: model.id,
+                title: `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}${enabledIds.has(model.id) ? ` · ${t('alreadyEnabled')}` : ''}`,
               })),
-            ],
-            onChange: (next) => {
-              setPresetPick(next);
-              const entry = next === '' ? undefined : state.catalog[next];
-              setAddModelDraft({
-                id: next,
-                name: '',
-                contextWindow: entry === undefined ? '' : String(entry.contextWindow),
-                maxTokens: entry === undefined ? '' : String(entry.maxTokens),
-              });
-            },
+              onChange: (next) => {
+                setFetchedPick(next);
+                const model = fetchedList.find((m) => m.id === next);
+                if (model === undefined) return;
+                setEditing(null);
+                setAddModelDraft({
+                  id: model.id,
+                  name: model.name !== undefined && model.name !== '' && model.name !== model.id ? model.name : '',
+                  contextWindow: model.contextWindow !== undefined ? String(model.contextWindow) : '',
+                  maxTokens: model.maxTokens !== undefined ? String(model.maxTokens) : '',
+                });
+              },
+            }),
           }),
-        }),
         React.createElement('div', { className: 'phub-custom-item' },
           React.createElement('input', {
             className: 'phub-input',
             placeholder: t('modelId'),
             value: addModelDraft.id,
+            disabled: editing !== null,
             onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setAddModelDraft((d) => ({ ...d, id: e.target.value })),
           }),
           React.createElement('input', {
@@ -728,7 +845,23 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
             value: addModelDraft.maxTokens,
             onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setAddModelDraft((d) => ({ ...d, maxTokens: e.target.value })),
           }),
-          React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: submitAddModel }, t('addCustom')),
+          React.createElement('span', { className: 'phub-form-buttons' },
+            React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: submitModelForm },
+              editing === null ? t('addCustom') : t('update')),
+            editing === null ? null : React.createElement('button', { className: 'phub-btn', onClick: cancelEdit }, t('cancel')),
+          ),
+        ),
+        // Contextual preset offer: the typed/selected id matches the built-in
+        // catalog (exact or fuzzy) — one click applies its parameters.
+        presetHit === undefined ? null : React.createElement('div', { className: 'phub-actions', style: { paddingTop: 6 } },
+          React.createElement('button', {
+            className: 'phub-suggest',
+            onClick: () => {
+              const preset = state.catalog[presetHit];
+              if (preset === undefined) return;
+              setAddModelDraft((d) => ({ ...d, contextWindow: String(preset.contextWindow), maxTokens: String(preset.maxTokens) }));
+            },
+          }, `${t('presetApply')} · ${state.catalog[presetHit]?.name ?? presetHit} (${state.catalog[presetHit]?.contextWindow ?? ''} / ${state.catalog[presetHit]?.maxTokens ?? ''})`),
         ),
         // -- Overrides: full-width JSON editor + save.
         SubHead(t('overrides'), t('overridesHint')),

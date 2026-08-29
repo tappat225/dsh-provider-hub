@@ -18,6 +18,15 @@ check('Config', !!plugin.Config);
 check('MODEL_CATALOG has glm-5.3', plugin.MODEL_CATALOG['glm-5.3']?.contextWindow > 0);
 check('NS', plugin.NS === 'llm-provider-hub');
 
+// 1b. Endpoint URL joining: both baseURL spellings (bare host and explicit
+// /v1 root) must resolve to the same endpoint set — the historical bug was
+// chat hard-coding /v1/... while /models appended a bare path.
+const { joinEndpoint } = await import('../src/url.ts');
+check('joinEndpoint: bare host gets /v1 inserted', joinEndpoint('https://gw.example.com', '/chat/completions') === 'https://gw.example.com/v1/chat/completions' && joinEndpoint('https://gw.example.com', '/models') === 'https://gw.example.com/v1/models', joinEndpoint('https://gw.example.com', '/models'));
+check('joinEndpoint: explicit /v1 root is not doubled', joinEndpoint('https://gw.example.com/v1', '/chat/completions') === 'https://gw.example.com/v1/chat/completions' && joinEndpoint('https://gw.example.com/v1', '/models') === 'https://gw.example.com/v1/models', joinEndpoint('https://gw.example.com/v1', '/models'));
+check('joinEndpoint: trailing slash + deployment sub-paths keep segments', joinEndpoint('https://gateway.example/openai/v1/', '/chat/completions') === 'https://gateway.example/openai/v1/chat/completions', joinEndpoint('https://gateway.example/openai/v1/', '/chat/completions'));
+check('joinEndpoint: any /vN root stays the root', joinEndpoint('https://gw.example.com/v2', '/models') === 'https://gw.example.com/v2/models');
+
 // 2. Config schema (multi-gateway)
 const config = plugin.Config({
   gateways: [{
@@ -138,8 +147,8 @@ const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
-    lastSeenHeaders = { ua: req.headers['user-agent'], key: req.headers['x-api-key'] ?? req.headers['authorization']?.slice(0, 12), body: body.slice(0, 120) };
-    if (req.url.startsWith('/models')) {
+    lastSeenHeaders = { url: req.url, ua: req.headers['user-agent'], key: req.headers['x-api-key'] ?? req.headers['authorization']?.slice(0, 12), body: body.slice(0, 120) };
+    if (req.url.endsWith('/models')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ object: 'list', data: [
         { id: 'glm-5.3', object: 'model', context_window: 200000, max_output_tokens: 131072 },
@@ -202,6 +211,18 @@ const chunksB = [];
 for await (const c of streamB) chunksB.push(c);
 check('multi-gateway B: openai stream works', chunksB.some((c) => c.type === 'text-delta'), JSON.stringify(chunksB.map((c) => c.type)));
 check('multi-gateway B: wire UA openai-gpt/4.0 + key Bearer sk-b', lastSeenHeaders?.ua === 'openai-gpt/4.0' && lastSeenHeaders?.key === 'Bearer sk-b', JSON.stringify(lastSeenHeaders));
+check('multi-gateway B: bare host gets /v1 inserted on the wire', lastSeenHeaders?.url === '/v1/chat/completions', String(lastSeenHeaders?.url));
+
+// 5c. explicit /v1 baseURL: the version segment must not double (the
+// "configure /v1 for the model list, chat then posts /v1/v1/..." bug).
+const v1Config = plugin.Config({ gateways: [{ ...config.gateways[0], api: 'openai-completions', baseURL: 'http://127.0.0.1:18996/v1' }] }).gateways[0];
+const v1Adapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [v1Config] }),
+  gatewayFor: (p) => v1Config.provider === p ? v1Config : undefined,
+  resolveApiKey: async () => 'sk-v1',
+});
+for await (const _c of v1Adapter.stream({ provider: 'air-outer', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
+check('openai /v1 root: single version segment on the wire', lastSeenHeaders?.url === '/v1/chat/completions', String(lastSeenHeaders?.url));
 
 // 6. openai path with reasoning_content + system prompt (systemRole)
 const oaiConfig = plugin.Config({ gateways: [{ ...config.gateways[0], api: 'openai-completions', systemRole: 'system' }] }).gateways[0];
@@ -336,9 +357,11 @@ check('runtime discover via echo', rd.ok === true && rd.models.length === 2 && r
 
 // 9a. testConnection: probe an UNSAVED draft (URL/key/headers) against /models.
 // The full listing rides along so the settings page can seed its discovery
-// list without a second fetch; trailing slashes normalize away.
+// list without a second fetch; a bare host is normalized to /v1/models.
 const tc = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996/', apiKey: 'sk-draft', extraHeaders: {} });
-check('runtime testConnection ok (draft, trailing slash)', tc.ok === true && tc.modelCount === 2 && tc.models.length === 2 && typeof tc.latencyMs === 'number' && tc.endpoint === 'http://127.0.0.1:18996/models', JSON.stringify(tc));
+check('runtime testConnection ok (draft, bare host -> /v1/models)', tc.ok === true && tc.modelCount === 2 && tc.models.length === 2 && typeof tc.latencyMs === 'number' && tc.endpoint === 'http://127.0.0.1:18996/v1/models', JSON.stringify(tc));
+const tcV1 = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996/v1', apiKey: 'sk-draft', extraHeaders: {} });
+check('runtime testConnection ok (draft, explicit /v1 root not doubled)', tcV1.ok === true && tcV1.endpoint === 'http://127.0.0.1:18996/v1/models' && tcV1.modelCount === 2, JSON.stringify(tcV1));
 // A draft apiKey merges over the saved one (empty literal -> env fallback).
 const tcKey = await runtime.testConnection(0, { apiKey: '' });
 check('runtime testConnection: empty draft apiKey falls back (env path)', tcKey.ok === true, String(tcKey.error));

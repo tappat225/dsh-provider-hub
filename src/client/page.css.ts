@@ -79,11 +79,14 @@ export default `
 .phub-model-params { font-variant-numeric: tabular-nums; font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); }
 .phub-custom-item { display: grid; grid-template-columns: 1.3fr 1fr 0.8fr 0.8fr auto; gap: 6px; padding: 6px 8px 0; align-items: center; }
 .phub-custom-item .phub-input { min-width: 0; width: 100%; }
-.phub-discover-list { display: flex; flex-direction: column; padding: 0 8px; }
-.phub-discover-item { display: flex; align-items: center; gap: 8px; font-size: 13px; line-height: 22px; padding: 4px 0; }
-.phub-discover-item .phub-btn, .phub-discover-item .phub-mark { margin-left: auto; }
+.phub-custom-item .phub-input:disabled { opacity: 0.65; }
+.phub-form-buttons { display: inline-flex; gap: 6px; align-items: center; }
 
-/* Sub-section heading inside a group card (enabled / discover / add / overrides). */
+/* Contextual "use preset parameters" offer (pill button, brand tinted). */
+.phub-suggest { height: 28px; padding: 0 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 999px; background: transparent; color: var(--dsw-alias-brand-primary); font: inherit; font-size: 12px; line-height: 18px; cursor: pointer; transition: border-color 0.12s ease, background 0.12s ease; }
+.phub-suggest:hover { border-color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-interactive-bg-hover); }
+
+/* Sub-section heading inside a group card (enabled / add / overrides). */
 .phub-subhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 14px 8px 6px; }
 .phub-subhead:first-child { padding-top: 8px; }
 .phub-subhead-title { font-size: 12px; line-height: 18px; font-weight: 600; color: var(--dsw-alias-label-secondary); }
@@ -100,7 +103,4 @@ export default `
 .phub-test-ok { border-color: rgba(152, 195, 121, 0.45); background: rgba(152, 195, 121, 0.08); color: #98c379; }
 .phub-test-err { border-color: rgba(224, 108, 117, 0.45); background: rgba(224, 108, 117, 0.08); color: #e06c75; }
 .phub-test-detail { color: var(--dsw-alias-label-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
-
-/* "Already enabled" pill on discovered rows. */
-.phub-mark { flex: none; padding: 1px 8px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 16px; }
 `;

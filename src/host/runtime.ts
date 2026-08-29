@@ -22,6 +22,7 @@ import type { LlmDiscoveredModel } from '@deepseek-ai/dsh-llm';
 import { MODEL_CATALOG, resolveModelEntries } from '../catalog.ts';
 import { discoverModels } from '../discovery.ts';
 import type { GatewayConfig, WireConfig } from '../types.ts';
+import { joinEndpoint } from '../url.ts';
 
 /** Business envelope: every method answers `{ ok, ... }` or `{ ok: false, error }`. */
 type Envelope = { ok: boolean } & Record<string, unknown>;
@@ -351,7 +352,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
         () => this.deps.resolveApiKey(testGateway),
       );
       return ok({
-        endpoint: `${baseURL.replace(/\/+$/, '')}/models`,
+        endpoint: joinEndpoint(baseURL, '/models'),
         latencyMs: Date.now() - started,
         modelCount: models.length,
         models,

@@ -26,6 +26,7 @@ import {
 } from '@deepseek-ai/dsh-llm';
 import { catalogEntryFor, reasoningMetadata, resolveModelEntries } from './catalog.ts';
 import type { GatewayConfig, WireConfig } from './types.ts';
+import { joinEndpoint } from './url.ts';
 import { errorFinish } from './wire/sse.ts';
 import { anthropicSseToChunks, toAnthropicMessages, toAnthropicTools } from './wire/anthropic.ts';
 import { openaiCompletionsToChunks, toOpenAIMessages, toOpenAITools } from './wire/openai.ts';
@@ -174,7 +175,9 @@ export class GatewayAdapter extends LlmAdapter {
       ...(options.tools !== undefined && options.tools.length > 0 ? { tools: toAnthropicTools(options.tools) } : {}),
       stream: true,
     };
-    const posted = await this.post(`${baseURL}/v1/messages`, {
+    // joinEndpoint accepts both `https://gw.example.com` and
+    // `https://gw.example.com/v1` (an explicit /vN root is never doubled).
+    const posted = await this.post(joinEndpoint(baseURL, '/messages'), {
       ...headers,
       'content-type': 'application/json',
       'x-api-key': apiKey,
@@ -206,7 +209,7 @@ export class GatewayAdapter extends LlmAdapter {
       ...(options.tools !== undefined && options.tools.length > 0 ? { tools: toOpenAITools(options.tools) } : {}),
       stream: true,
     };
-    const posted = await this.post(`${baseURL}/v1/chat/completions`, {
+    const posted = await this.post(joinEndpoint(baseURL, '/chat/completions'), {
       ...headers,
       'content-type': 'application/json',
       authorization: `Bearer ${apiKey}`,

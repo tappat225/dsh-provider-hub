@@ -8,9 +8,14 @@
  */
 import { LlmError, type LlmDiscoveredModel, type LlmModelDiscoveryRequest } from '@deepseek-ai/dsh-llm';
 import type { GatewayConfig } from './types.ts';
+import { joinEndpoint } from './url.ts';
 
 function listingUrl(baseURL: string): string {
-  return `${baseURL.replace(/\/+$/, '')}/models`;
+  // Same /v1 auto-normalization as the chat endpoints: a base ending in /vN
+  // is the API root, anything else gets /v1 inserted — so `https://gw.example.com`
+  // and `https://gw.example.com/v1` both list models consistently with how
+  // chat requests are routed.
+  return joinEndpoint(baseURL, '/models');
 }
 
 function label(...candidates: Array<unknown>): string | undefined {
