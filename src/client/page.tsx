@@ -15,6 +15,7 @@ import type * as ReactTypes from 'react';
 // its platform seed table, so the built bundle calls require("react") and
 // gets the renderer's React instance (no global dependency).
 import React from 'react';
+import { Menu, IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives';
 import css from './page.css.ts';
 import { zh, en } from './locales.ts';
 
@@ -99,16 +100,59 @@ function ChipUI(props: { text: string }): ReactTypes.ReactElement {
   return React.createElement('span', { className: 'phub-icon-chip' }, ch);
 }
 
-const REASONING_PRESETS = [
-  'off', 'low', 'medium', 'high', 'xhigh', 'max',
-];
+interface SelectMenuOption {
+  value: string;
+  title: string;
+}
+
+/**
+ * DSH-style dropdown: a closed anchor button (like an input) + the platform
+ * `Menu` primitive (dark-theme list, check mark on the selected item, portal
+ * positioning). Replaces native <select>, whose chrome clashes with the DSH
+ * settings theme (the better-sidebar SelectMenu recipe).
+ */
+function SelectMenu(props: {
+  label: string;
+  value: string;
+  options: SelectMenuOption[];
+  onChange: (next: string) => void;
+  disabled?: boolean;
+}): ReactTypes.ReactElement {
+  const [open, setOpen] = React.useState(false);
+  const selected = props.options.find((o) => o.value === props.value);
+  const anchor = React.createElement('button', {
+    type: 'button',
+    className: 'phub-select-anchor',
+    disabled: props.disabled === true,
+    'aria-haspopup': 'listbox',
+    'aria-expanded': open,
+    'aria-label': props.label,
+    onClick: () => setOpen((now) => !now),
+  },
+    React.createElement('span', { className: 'phub-select-anchor-text' }, selected?.title ?? props.value ?? '—'),
+    React.createElement(IconChevronDownOutline14, { size: 12 }),
+  );
+  return React.createElement(Menu, {
+    open,
+    anchor,
+    items: props.options.map((o) => ({ id: o.value, label: o.title })),
+    selectedId: props.value,
+    onSelect: (id: string) => {
+      props.onChange(id);
+      setOpen(false);
+    },
+    onClose: () => setOpen(false),
+    portal: true,
+  });
+}
 
 export function ProviderHubPage(props: PageProps): React.ReactElement {
   const { t, call } = props;
   const [state, setState] = React.useState<State>({ gateways: [], catalog: {}, selected: null });
   const [status, setStatus] = React.useState<Status>(null);
   const [busy, setBusy] = React.useState(false);
-  const [customRows, setCustomRows] = React.useState<Record<number, Array<Record<string, string>>>>({});
+  const [addModelDraft, setAddModelDraft] = React.useState<{ id: string; name: string; contextWindow: string; maxTokens: string }>(
+    { id: '', name: '', contextWindow: '', maxTokens: '' });
   const [overridesText, setOverridesText] = React.useState<Record<number, string>>({});
   const [headersText, setHeadersText] = React.useState<Record<number, string>>({});
   const [presetProviders, setPresetProviders] = React.useState<Array<{ provider: string; displayName: string }>>([]);
@@ -126,21 +170,12 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       }
       const value = r as unknown as { gateways: GatewayEntry[]; catalog: State['catalog'] };
       setState((s) => ({ ...s, gateways: value.gateways, catalog: value.catalog }));
-      const nextCustom: Record<number, Array<Record<string, string>>> = {};
       const nextOverrides: Record<number, string> = {};
       const nextHeaders: Record<number, string> = {};
       for (const g of value.gateways) {
-        nextCustom[g.index] = ((g.gateway.customModels as Array<Record<string, unknown>> | undefined) ?? []).map((m) => ({
-          id: String(m.id ?? ''),
-          name: String(m.name ?? ''),
-          contextWindow: String(m.contextWindow ?? ''),
-          maxTokens: String(m.maxTokens ?? ''),
-          reasoningEfforts: JSON.stringify(m.reasoningEfforts ?? {}),
-        }));
         nextOverrides[g.index] = JSON.stringify(g.gateway.modelOverrides ?? {}, null, 2);
         nextHeaders[g.index] = JSON.stringify(g.gateway.extraHeaders ?? {}, null, 2);
       }
-      setCustomRows(nextCustom);
       setOverridesText(nextOverrides);
       setHeadersText(nextHeaders);
       const rp = await call('list-presets');
@@ -255,48 +290,51 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     }
   };
 
-  const addCustomRow = () => {
+  /**
+   * Add one model: ids matching the built-in catalog are enabled as catalog
+   * entries (params auto-filled; non-default inputs become field overrides);
+   * anything else is stored as a custom model with the given (or default)
+   * params. Backed by the runtime's enableDiscovered.
+   */
+  const submitAddModel = () => {
     const selected = state.selected;
     if (selected === null) return;
-    setCustomRows((rows) => ({
-      ...rows,
-      [selected]: [...(rows[selected] ?? []), { id: '', name: '', contextWindow: '', maxTokens: '', reasoningEfforts: '{}' }],
-    }));
-  };
-
-  const saveCustomRow = async (rowIndex: number) => {
-    const selected = state.selected;
-    if (selected === null) return;
-    const row = (customRows[selected] ?? [])[rowIndex];
-    if (row === undefined || row.id.trim() === '') {
+    const id = addModelDraft.id.trim();
+    if (id === '') {
       setStatus({ kind: 'err', text: t('modelId') + ' ' + t('required') });
       return;
     }
-    let reasoningEfforts: unknown = {};
-    try {
-      reasoningEfforts = JSON.parse(row.reasoningEfforts || '{}');
-    } catch {
-      setStatus({ kind: 'err', text: 'reasoningEfforts: invalid JSON' });
-      return;
-    }
-    const entry: Record<string, unknown> = {
-      id: row.id.trim(),
-      name: row.name.trim(),
-      contextWindow: Number(row.contextWindow) || undefined,
-      maxTokens: Number(row.maxTokens) || undefined,
-      reasoningEfforts,
-    };
-    const r = await call('upsert-custom', { index: selected, entry, originalId: { id: row.id.trim() } });
-    if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-    else void refresh();
+    void (async () => {
+      const entry: Record<string, unknown> = {
+        id,
+        ...(addModelDraft.name.trim() === '' ? {} : { name: addModelDraft.name.trim() }),
+        ...(addModelDraft.contextWindow.trim() === '' ? {} : { contextWindow: Number(addModelDraft.contextWindow) || undefined }),
+        ...(addModelDraft.maxTokens.trim() === '' ? {} : { maxTokens: Number(addModelDraft.maxTokens) || undefined }),
+      };
+      const r = await call('enable-discovered', { index: selected, model: entry });
+      if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
+      else {
+        setStatus({ kind: 'ok', text: `${id} ${t('enable')} ✓` });
+        setAddModelDraft({ id: '', name: '', contextWindow: '', maxTokens: '' });
+        void refresh();
+      }
+    })();
   };
 
-  const deleteCustomRow = async (id: string) => {
+  /** Remove one enabled model: built-in catalog ids toggle off, custom models delete. */
+  const removeModel = (id: string) => {
     const selected = state.selected;
     if (selected === null) return;
-    const r = await call('delete-custom', { index: selected, id });
-    if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-    else void refresh();
+    void (async () => {
+      const builtin = state.catalog[id] !== undefined;
+      const r = builtin ? await call('toggle-builtin', { index: selected, id, enabled: false })
+        : await call('delete-custom', { index: selected, id });
+      if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
+      else {
+        setStatus({ kind: 'ok', text: `${id} ${t('remove')} ✓` });
+        void refresh();
+      }
+    })();
   };
 
   const importPreset = async () => {
@@ -317,7 +355,9 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       contextWindow: info.context?.contextWindow,
       maxTokens: info.defaultMaxTokens,
     };
-    const r2 = await call('upsert-custom', { index: selected, entry, originalId: null });
+    // enable-discovered applies catalog auto-config when the id hits the
+    // built-in catalog; otherwise it inserts a custom model.
+    const r2 = await call('enable-discovered', { index: selected, model: entry });
     if (!r2.ok) setStatus({ kind: 'err', text: String((r2 as { error?: unknown }).error ?? '') });
     else {
       setStatus({ kind: 'ok', text: `${info.id} ${t('importPreset')} ✓` });
@@ -485,25 +525,12 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         fieldRow('baseURL', `${t('baseURL')} *`, undefined, t('baseURLPlaceholder')),
         Row({
           title: t('api'),
-          control: React.createElement('select', {
-            className: 'phub-select',
+          control: SelectMenu({
+            label: t('api'),
             value: String(cfg.api ?? 'anthropic-messages'),
-            onChange: (e: ReactTypes.ChangeEvent<HTMLSelectElement>) => setField('api', e.target.value),
-          },
-          React.createElement('option', { value: 'anthropic-messages' }, 'anthropic-messages'),
-          React.createElement('option', { value: 'openai-completions' }, 'openai-completions'),
-          ),
-        }),
-        Row({
-          title: t('systemRole'),
-          control: React.createElement('select', {
-            className: 'phub-select',
-            value: String(cfg.systemRole ?? 'system'),
-            onChange: (e: ReactTypes.ChangeEvent<HTMLSelectElement>) => setField('systemRole', e.target.value),
-          },
-          React.createElement('option', { value: 'system' }, 'system'),
-          React.createElement('option', { value: 'developer' }, 'developer'),
-          ),
+            options: [{ value: 'anthropic-messages', title: 'anthropic-messages' }, { value: 'openai-completions', title: 'openai-completions' }],
+            onChange: (next) => setField('api', next),
+          }),
         }),
         fieldRow('userAgent', t('userAgent')),
         fieldRow('apiKey', t('apiKey')),
@@ -536,21 +563,79 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       React.createElement('div', { className: 'phub-group-heading' },
         t('models'),
         React.createElement('span', { className: 'phub-count' },
-          String(((cfg.enabledModels as string[] | undefined) ?? []).length),
+          String((selectedEntry.models ?? []).length),
         ),
       ),
       React.createElement('div', { className: 'phub-group' },
-        React.createElement('div', { className: 'phub-editor-note', style: { paddingTop: 10 } }, t('builtinHint')),
+        // Enabled model list: catalog entries + custom models, each removable.
+        React.createElement('div', { className: 'phub-editor-note', style: { paddingTop: 10 } }, t('modelsEnabled')),
         React.createElement('div', { className: 'phub-models-list', style: { marginTop: 4 } },
-          Object.entries(state.catalog).map(([id, entry]) => Row({
-            key: id,
-            title: entry.name,
-            desc: React.createElement('span', { className: 'phub-model-params' }, `${entry.contextWindow} · ${entry.maxTokens}`),
-            control: SwitchUI({
-              checked: ((cfg.enabledModels as string[] | undefined) ?? []).includes(id),
-              onChange: (next) => toggleBuiltin(id, next),
+          (selectedEntry.models ?? []).length === 0
+            ? React.createElement('span', { className: 'phub-editor-note', style: { padding: '6px 8px' } }, `${t('empty')} — ${t('addModelHint')}`)
+            : (selectedEntry.models ?? []).map((m) => {
+              const id = String(m.id ?? '');
+              const name = String(m.name ?? id);
+              const ctx = String(m.contextWindow ?? '');
+              const max = String(m.maxTokens ?? '');
+              return Row({
+                key: id,
+                title: name,
+                desc: React.createElement('span', { className: 'phub-model-params' },
+                  `${id}${ctx === '' ? '' : ` · ${ctx}`}${max === '' ? '' : ` · ${max}`}${
+                    state.catalog[id] !== undefined ? '' : ` · ${t('custom')}`}`,
+                ),
+                control: React.createElement('button', {
+                  className: 'phub-btn phub-btn-danger',
+                  title: t('remove'),
+                  onClick: () => void removeModel(id),
+                }, t('remove')),
+              });
             }),
-          })),
+        ),
+        React.createElement('div', { className: 'phub-actions' },
+          React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void runDiscover() }, t('discover')),
+          React.createElement('span', { className: 'phub-editor-note' }, t('discoverHint')),
+        ),
+        discovered[selected] === null || discovered[selected] === undefined ? null
+          : React.createElement('div', { className: 'phub-discover-list' },
+            (discovered[selected] ?? []).map((model) => React.createElement('div', { className: 'phub-discover-item', key: model.id },
+              React.createElement('span', null,
+                `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}`,
+              ),
+              React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
+            )),
+          ),
+        // Add-model row: catalog ids auto-fill params, others become custom.
+        Row({
+          title: t('addModel'),
+          desc: t('addModelHint'),
+        }),
+        React.createElement('div', { className: 'phub-custom-item' },
+          React.createElement('input', {
+            className: 'phub-input',
+            placeholder: t('modelId'),
+            value: addModelDraft.id,
+            onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setAddModelDraft((d) => ({ ...d, id: e.target.value })),
+          }),
+          React.createElement('input', {
+            className: 'phub-input',
+            placeholder: t('modelName'),
+            value: addModelDraft.name,
+            onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setAddModelDraft((d) => ({ ...d, name: e.target.value })),
+          }),
+          React.createElement('input', {
+            className: 'phub-input',
+            placeholder: t('contextWindow'),
+            value: addModelDraft.contextWindow,
+            onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setAddModelDraft((d) => ({ ...d, contextWindow: e.target.value })),
+          }),
+          React.createElement('input', {
+            className: 'phub-input',
+            placeholder: t('maxTokens'),
+            value: addModelDraft.maxTokens,
+            onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setAddModelDraft((d) => ({ ...d, maxTokens: e.target.value })),
+          }),
+          React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: submitAddModel }, t('addCustom')),
         ),
         Row({
           title: `${t('overrides')} (JSON)`,
@@ -566,77 +651,28 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
           React.createElement('button', { className: 'phub-btn', onClick: saveOverrides }, `${t('overrides')}: ${t('save')}`),
         ),
         Row({
-          title: t('custom'),
-          desc: (customRows[selected] ?? []).length === 0 ? t('empty') : undefined,
-          control: React.createElement('button', { className: 'phub-btn', onClick: addCustomRow }, `+ ${t('addCustom')}`),
-        }),
-        ((customRows[selected] ?? []).length === 0 ? null : (customRows[selected] ?? []).map((row, rowIndex) =>
-          React.createElement('div', { className: 'phub-custom-item', key: rowIndex },
-            React.createElement('input', {
-              className: 'phub-input',
-              placeholder: t('modelId'),
-              value: row.id,
-              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
-                const next = [...(customRows[selected] ?? [])];
-                next[rowIndex] = { ...row, id: e.target.value };
-                setCustomRows((rows) => ({ ...rows, [selected]: next }));
-              },
-            }),
-            React.createElement('input', {
-              className: 'phub-input',
-              placeholder: t('modelName'),
-              value: row.name,
-              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
-                const next = [...(customRows[selected] ?? [])];
-                next[rowIndex] = { ...row, name: e.target.value };
-                setCustomRows((rows) => ({ ...rows, [selected]: next }));
-              },
-            }),
-            React.createElement('input', {
-              className: 'phub-input',
-              placeholder: t('contextWindow'),
-              value: row.contextWindow,
-              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
-                const next = [...(customRows[selected] ?? [])];
-                next[rowIndex] = { ...row, contextWindow: e.target.value };
-                setCustomRows((rows) => ({ ...rows, [selected]: next }));
-              },
-            }),
-            React.createElement('input', {
-              className: 'phub-input',
-              placeholder: t('maxTokens'),
-              value: row.maxTokens,
-              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
-                const next = [...(customRows[selected] ?? [])];
-                next[rowIndex] = { ...row, maxTokens: e.target.value };
-                setCustomRows((rows) => ({ ...rows, [selected]: next }));
-              },
-            }),
-            React.createElement('button', { className: 'phub-btn', onClick: () => void saveCustomRow(rowIndex) }, t('save')),
-            React.createElement('button', { className: 'phub-btn', onClick: () => void deleteCustomRow(row.id) }, t('delete')),
-          ),
-        )),
-        Row({
           title: t('presetFrom'),
           desc: t('presetHint'),
           control: React.createElement('span', { className: 'phub-control' },
-            React.createElement('select', {
-              className: 'phub-select',
+            SelectMenu({
+              label: t('presetProvider'),
               value: presetProvider[selected] ?? '',
-              onChange: (e: ReactTypes.ChangeEvent<HTMLSelectElement>) => void loadPresetModels(e.target.value),
-            },
-            React.createElement('option', { value: '' }, '—'),
-            presetProviders.map((p) => React.createElement('option', { key: p.provider, value: p.provider }, `${p.displayName} (${p.provider})`)),
-            ),
-            React.createElement('select', {
-              className: 'phub-select',
+              options: [
+                { value: '', title: '—' },
+                ...presetProviders.map((p) => ({ value: p.provider, title: `${p.displayName} (${p.provider})` })),
+              ],
+              onChange: (next) => void loadPresetModels(next),
+            }),
+            SelectMenu({
+              label: t('presetModel'),
               value: presetModel[selected] ?? '',
               disabled: (presetModels[selected] ?? []).length === 0,
-              onChange: (e: ReactTypes.ChangeEvent<HTMLSelectElement>) => setPresetModel((p) => ({ ...p, [selected]: e.target.value })),
-            },
-            React.createElement('option', { value: '' }, '—'),
-            (presetModels[selected] ?? []).map((m) => React.createElement('option', { key: m.id, value: m.id }, m.name ?? m.id)),
-            ),
+              options: [
+                { value: '', title: '—' },
+                ...(presetModels[selected] ?? []).map((m) => ({ value: m.id, title: m.name ?? m.id })),
+              ],
+              onChange: (next) => setPresetModel((p) => ({ ...p, [selected]: next })),
+            }),
             React.createElement('button', { className: 'phub-btn', disabled: (presetModel[selected] ?? '') === '', onClick: () => void importPreset() }, t('importPreset')),
           ),
         }),

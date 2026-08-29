@@ -51,10 +51,16 @@ check('factory is a function', typeof registration.factory === 'function');
 
 // Materialize: the module system's require answers seed words only.
 const reactStub = { createElement: () => ({}), Fragment: Symbol('fragment') };
+// The renderer seed table provides dsh-client-ui-primitives (see
+// dsh-web-frontend/dist/assets/index-*.js seed map); the page imports its
+// Menu primitive + chevron icon. Stub both (the page component never renders
+// inside this test, only the module factory runs).
+const primitivesStub = { Menu: () => null, IconChevronDownOutline14: () => null };
 let exports;
 try {
   exports = registration.factory((specifier) => {
     if (specifier === 'react') return reactStub;
+    if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return primitivesStub;
     throw new Error(`unexpected require: ${specifier}`);
   });
   check('factory did not throw', true);
@@ -122,7 +128,7 @@ if (exports !== undefined) {
 
 // The bundle must not reference any bare module besides the seed words.
 const externalRequires = [...code.matchAll(/require\(\s*"([^"]+)"\s*\)/g)].map((m) => m[1]);
-const unexpected = [...new Set(externalRequires)].filter((spec) => !['react'].includes(spec));
+const unexpected = [...new Set(externalRequires)].filter((spec) => !['react', '@deepseek-ai/dsh-client-ui-primitives'].includes(spec));
 check('only seed-word requires remain', unexpected.length === 0, unexpected.join(', '));
 
 if (failures > 0) process.exit(1);

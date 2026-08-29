@@ -37,9 +37,15 @@ export default `
 .phub-switch-input:focus-visible + .phub-switch-track { outline: 2px solid var(--dsw-alias-state-business-primary); outline-offset: 2px; }
 
 /* Inputs / selects / textareas. */
-.phub-input, .phub-select { height: 32px; padding: 0 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; box-sizing: border-box; }
-.phub-input { min-width: 220px; }
-.phub-input:focus, .phub-select:focus { outline: none; border-color: var(--dsw-alias-state-business-primary); }
+.phub-input { height: 32px; padding: 0 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; box-sizing: border-box; min-width: 220px; }
+.phub-input:focus { outline: none; border-color: var(--dsw-alias-state-business-primary); }
+/* Dropdown anchor (primitives Menu trigger): looks like an input, acts like
+   a button. The popup itself is the platform Menu (dark theme, check mark). */
+.phub-select-anchor { display: inline-flex; align-items: center; gap: 6px; height: 32px; min-width: 160px; max-width: 260px; padding: 0 10px; box-sizing: border-box; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; font-size: 13px; line-height: 20px; cursor: pointer; transition: border-color 0.12s ease; }
+.phub-select-anchor:hover:not(:disabled) { border-color: var(--dsw-alias-label-dimmed); }
+.phub-select-anchor:disabled { opacity: 0.5; cursor: default; }
+.phub-select-anchor-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.phub-select-anchor:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary); outline-offset: 2px; }
 .phub-textarea { width: 100%; min-height: 72px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; box-sizing: border-box; resize: vertical; }
 .phub-textarea:focus { outline: none; border-color: var(--dsw-alias-state-business-primary); }
 
@@ -68,7 +74,7 @@ export default `
 .phub-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 8px 0; }
 .phub-models-list { display: flex; flex-direction: column; }
 .phub-model-params { font-variant-numeric: tabular-nums; font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); }
-.phub-custom-item { display: grid; grid-template-columns: 1.3fr 1fr 0.8fr 0.8fr auto auto; gap: 6px; padding: 6px 8px 0; align-items: center; }
+.phub-custom-item { display: grid; grid-template-columns: 1.3fr 1fr 0.8fr 0.8fr auto; gap: 6px; padding: 6px 8px 0; align-items: center; }
 .phub-custom-item .phub-input { min-width: 0; width: 100%; }
 .phub-discover-list { display: flex; flex-direction: column; padding: 0 8px; }
 .phub-discover-item { display: flex; align-items: center; gap: 8px; font-size: 13px; line-height: 22px; padding: 4px 0; }

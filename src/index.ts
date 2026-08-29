@@ -190,29 +190,55 @@ export function apply(ctx: Context, config: WireConfig) {
     preset: (provider: string) => presetEntries.get(provider),
   });
 
-  const providers = current().gateways.map((gw) => gw.provider);
-  if (providers.length > 0) {
-    ctx.llm.registerConfigurableProviders(current().gateways.map((gw) => ({
-      provider: gw.provider,
-      displayName: gw.displayName || DEFAULT_DISPLAY_NAME,
-      settingsNs: NS,
-      settingsPath: [],
-    })));
-    ctx.llm.registerAdapter(providers, adapter);
-    ctx.llm.registerModelDiscovery(NS, (request) => {
-      // The discovery request is a draft (baseURL/apiKey), not a stored route:
-      // find the gateway whose baseURL matches, else fall back to the first.
-      const gw = current().gateways.find((g) => {
-        const base = g.baseURL?.replace(/\/+$/, '');
-        const want = request.baseURL?.replace(/\/+$/, '');
-        return base !== undefined && want !== undefined && base === want;
-      }) ?? current().gateways[0];
-      if (gw === undefined) {
-        throw new LlmError('llm-provider-hub: model discovery needs a gateway with a baseURL; add one in the plugin settings', 'DISCOVERY_FAILED');
-      }
-      return discoverModels(request, gw, () => resolveApiKey(gw));
-    });
-  }
+  // Live LLM route registration. The configuration at apply time is the
+  // composition entry (normally `{}`); the real gateways arrive through the
+  // settings service, which binds asynchronously AFTER apply. dsh-llm
+  // registrations are fiber-bound and expose `handle.replace(next)` for an
+  // atomic swap, so the routes are synced — at apply, at settings bind, and
+  // on every settings commit — through registerLlmRoutes(). Without this the
+  // model picker never sees the gateways' models ("registered 0 gateways").
+  type DirectoryEntry = { provider: string; displayName: string; settingsNs: string; settingsPath: string[] };
+  let directoryHandle: { replace(next: DirectoryEntry[]): void } | undefined;
+  let adapterHandle: { replace(next: string[]): void } | undefined;
+  const registerLlmRoutes = (): void => {
+    const gateways = current().gateways;
+    const providers = gateways.map((gw) => gw.provider);
+    try {
+      const entries: DirectoryEntry[] = gateways.map((gw) => ({
+        provider: gw.provider,
+        displayName: gw.displayName || DEFAULT_DISPLAY_NAME,
+        settingsNs: NS,
+        settingsPath: [],
+      }));
+      if (directoryHandle !== undefined) directoryHandle.replace(entries);
+      else if (entries.length > 0) directoryHandle = ctx.llm.registerConfigurableProviders(entries);
+    } catch (error) {
+      ctx.logger.warn(`provider-hub: configurable-provider sync failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      if (adapterHandle !== undefined) adapterHandle.replace(providers);
+      else if (providers.length > 0) adapterHandle = ctx.llm.registerAdapter(providers, adapter);
+    } catch (error) {
+      ctx.logger.warn(`provider-hub: adapter sync failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  // Model discovery offer: namespace-keyed, one per plugin, independent of
+  // how many gateways exist (the request is a draft, not a stored route).
+  ctx.llm.registerModelDiscovery(NS, (request) => {
+    // The discovery request is a draft (baseURL/apiKey), not a stored route:
+    // find the gateway whose baseURL matches, else fall back to the first.
+    const gw = current().gateways.find((g) => {
+      const base = g.baseURL?.replace(/\/+$/, '');
+      const want = request.baseURL?.replace(/\/+$/, '');
+      return base !== undefined && want !== undefined && base === want;
+    }) ?? current().gateways[0];
+    if (gw === undefined) {
+      throw new LlmError('llm-provider-hub: model discovery needs a gateway with a baseURL; add one in the plugin settings', 'DISCOVERY_FAILED');
+    }
+    return discoverModels(request, gw, () => resolveApiKey(gw));
+  });
+  registerLlmRoutes();
 
   // Client-half remote service: the settings page (lib/client.js) manages
   // the same configuration through this namespace.
@@ -297,10 +323,17 @@ export function apply(ctx: Context, config: WireConfig) {
         );
       };
       report('settings setup');
+      // THE model-picker fix: at apply time no gateways were known (entry
+      // config), so registerLlmRoutes() was a no-op. Now that the live
+      // configuration is bound, register the adapter/directory routes (and
+      // re-sync on every commit) so the model picker sees the gateways.
+      registerLlmRoutes();
+      ctx.logger.info(`provider-hub: llm routes synced: ${current().gateways.length} gateway(s) bound=${bindMark}`);
       // Every commit rebinds the live reader and cross-checks the views.
       scope.watch(() => {
         current = read;
         report('settings watch');
+        registerLlmRoutes();
       });
       // Settings fiber disposed while the plugin lives: fall back to the
       // composition entry (the official installSettingsSection behaviour);

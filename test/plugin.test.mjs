@@ -388,12 +388,13 @@ const rebindSettings = {
   },
 };
 const rebindInjects = {};
+const rebindLlmCalls = { directory: [], adapter: [], discovery: 0 };
 const rebindCtx = {
   get: () => undefined,
   llm: {
-    registerConfigurableProviders: () => {},
-    registerAdapter: () => {},
-    registerModelDiscovery: () => {},
+    registerConfigurableProviders: (entries) => { rebindLlmCalls.directory = entries; return { replace: (next) => { rebindLlmCalls.directory = next; } }; },
+    registerAdapter: (providers, adapter) => { rebindLlmCalls.adapter = { providers: [...providers], adapter }; return { replace: (next) => { rebindLlmCalls.adapter.providers = [...next]; } }; },
+    registerModelDiscovery: () => { rebindLlmCalls.discovery += 1; return () => {}; },
   },
   inject: (services, cb) => { rebindInjects[services[0]] = cb; },
   logger: { info: () => {}, warn: () => {} },
@@ -408,6 +409,11 @@ const rebindTypertCtx = {
 };
 rebindInjects['settings']({ settings: rebindSettings, effect: (fn) => { fn(); return () => {}; }, get: () => undefined });
 rebindInjects['typert'](rebindTypertCtx);
+// The model-picker fix: routes must be registered once settings binds — not
+// gated on the (empty) composition entry at apply time.
+check('rebind: adapter routes registered on settings bind (hub-gateway)', rebindLlmCalls.adapter.providers.includes('hub-gateway'), JSON.stringify(rebindLlmCalls.adapter.providers));
+check('rebind: configurable-provider directory declared', rebindLlmCalls.directory.some((e) => e.provider === 'hub-gateway'), JSON.stringify(rebindLlmCalls.directory));
+check('rebind: model discovery registered once', rebindLlmCalls.discovery === 1, String(rebindLlmCalls.discovery));
 const rebindRuntime = rebindServices.providerHub;
 check('rebind: runtime captured (providerHub service)', rebindRuntime !== undefined, String(rebindRuntime));
 const rebindState = await rebindRuntime.getState();
