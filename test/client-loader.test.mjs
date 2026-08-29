@@ -4,7 +4,9 @@
 //   2. the registration id equals the loader entry name (dsh-provider-hub);
 //   3. the factory resolves `react` through the module system's require and
 //      returns { apply, inject, name };
-//   4. apply() never throws on an empty/degraded ctx.
+//   4. apply() never throws on an empty/degraded ctx;
+//   5. apply() mounts the `providerHub` Remote contribution via ctx.remote.$mount
+//      and tolerates an unavailable "slots" service.
 //
 // This is the regression guard for the recovery-mode bug: a bundle that does
 // not register a factory makes the web boot fail with "entries did not
@@ -74,13 +76,47 @@ if (exports !== undefined) {
     check('apply() tolerates an empty ctx', false, String(error));
   }
 
-  // apply() must tolerate an unavailable "slots" service.
+  // apply() must mount the providerHub Remote and tolerate a missing slots.
+  const mounts = [];
+  const injected = [];
+  let invokeTarget = null;
+  const remoteMock = {
+    async $mount(contribution) {
+      mounts.push(contribution);
+      return async () => {};
+    },
+  };
+  const slotsCtx = {
+    get: () => undefined,
+    effect: (fn) => fn(),
+    inject(deps, callback) {
+      injected.push(deps);
+      if (deps[0] === 'remote.providerHub') invokeTarget = callback;
+    },
+    remote: remoteMock,
+  };
   try {
-    const slotsCtx = { get: () => undefined, effect: () => () => undefined, remote: { providerHub: { getState: async () => ({ ok: true, gateways: [], catalog: {} }) } } };
     exports.apply(slotsCtx);
     check('apply() tolerates missing slots', true);
   } catch (error) {
     check('apply() tolerates missing slots', false, String(error));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  check('apply() mounted the providerHub contribution', mounts.length === 1, `got ${mounts.length}`);
+  if (mounts.length === 1) {
+    check('contribution package = dsh-provider-hub', mounts[0].package === 'dsh-provider-hub');
+    check('contribution carries providerHub descriptors', Array.isArray(mounts[0].descriptors) && mounts[0].descriptors.length > 0 && mounts[0].descriptors.every((d) => d.namespace === 'providerHub'), `descriptors=${mounts[0].descriptors?.length}`);
+    check('descriptor for addGateway present', mounts[0].descriptors.some((d) => d.method === 'addGateway'));
+    check('descriptors are strict (result mode strict)', mounts[0].descriptors.every((d) => d.result?.mode === 'strict' && d.invocation?.kind === 'direct'));
+  }
+  check('injected remote.providerHub', injected.some((deps) => deps[0] === 'remote.providerHub'));
+  if (invokeTarget !== null) {
+    try {
+      invokeTarget({ remote: { providerHub: { getState: async () => ({ ok: true, value: { ok: true, gateways: [], catalog: {} } }) } } });
+      check('inject callback resolves providerHub', true);
+    } catch (error) {
+      check('inject callback resolves providerHub', false, String(error));
+    }
   }
 }
 

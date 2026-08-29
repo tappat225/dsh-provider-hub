@@ -15,10 +15,18 @@ import type * as ReactTypes from 'react';
 // gets the renderer's React instance (no global dependency).
 import React from 'react';
 import { ProviderHubPage, css, zh, en, type Translate, type Call } from './page.tsx';
+// Strict Typert invocation descriptors for the `providerHub` Remote; the
+// client half mounts them through ctx.remote.$mount (same wire contract the
+// host registers through ctx.typert.register).
+import { INVOCATIONS } from '../host/contract.ts';
 
 export const name = 'provider-hub';
-/** No hard inject: every dependency is acquired defensively at apply time. */
-export const inject: string[] = [];
+/** Cordis service injections (official client-plugin pattern): wait for the
+ *  slots (settings sections), locale and remote (Client Remote service from
+ *  @deepseek-ai/dsh-api-gateway) services before activating, so
+ *  `ctx.remote.$mount` is available at apply time. All three are built-in
+ *  services every DSH profile provides. */
+export const inject: string[] = ['slots', 'locale', 'remote'];
 
 const NS = 'settings.provider-hub';
 const SLOT_ID = 'provider-hub-settings';
@@ -108,60 +116,76 @@ export function apply(ctx: any): void {
     }
     adoptStyles();
 
-    // --- Remote namespace (defensive) ---
-    // The host registers the `providerHub` Remote through typert; the client
-    // runtime exposes it as `ctx.remote.providerHub` (a generated proxy).
-    // There is NO `$mount` on the client remote service — calling it throws.
+    // --- Remote namespace (official client pattern: $mount + inject) ---
+    // The host registers the `providerHub` Typert Remote (ctx.typert.register
+    // in src/index.ts). The client half must mount the matching contribution
+    // through the Client Remote service ($mount, provided by
+    // @deepseek-ai/dsh-api-gateway) which installs a `remote.providerHub`
+    // Cordis service; access it via ctx.inject(["remote.providerHub"]).
+    // Method calls are transported over connection.rpc.call("/api", ...) and
+    // return the transport envelope { ok, value } wrapping the business
+    // envelope from the host runtime.
     let remote: any = null;
-    const tryGetRemote = (): any => {
-      try {
-        const r = ctx?.remote;
-        if (r === null || typeof r !== 'object') return null;
-        return r.providerHub ?? null;
-      } catch {
-        return null;
+    let remoteError: string | undefined;
+    const waitForRemote = async (): Promise<any> => {
+      for (let i = 0; i < 100; i++) {
+        if (remote !== null) return remote;
+        await new Promise((resolve) => setTimeout(resolve, 50));
       }
+      return null;
     };
-    remote = tryGetRemote();
-    if (remote === null && typeof ctx?.effect === 'function') {
-      try {
-        // The Remote proxy may appear after the host manifest registers;
-        // retry briefly (a few ticks) without ever throwing.
-        ctx.effect(async () => {
-          try {
-            for (let i = 0; i < 50; i++) {
-              const hit = tryGetRemote();
-              if (hit !== null) {
-                remote = hit;
-                return;
-              }
-              await new Promise((resolve) => setTimeout(resolve, 50));
+    try {
+      const remoteService: unknown = ctx?.remote;
+      if (remoteService !== null && typeof remoteService === 'object' && typeof (remoteService as { $mount?: unknown }).$mount === 'function'
+        && typeof ctx?.effect === 'function' && typeof ctx?.inject === 'function') {
+        ctx.effect(() => {
+          let cancelled = false;
+          let unmount: (() => Promise<void>) | undefined;
+          const contribution = { package: 'dsh-provider-hub', descriptors: INVOCATIONS };
+          void (remoteService as { $mount(c: unknown): Promise<() => Promise<void>> }).$mount(contribution).then((dispose) => {
+            if (cancelled) {
+              void dispose();
+              return;
             }
-          } catch {
-            remote = null;
-          }
-        }, 'dsh-provider-hub: remote wait');
-      } catch {
-        remote = null;
+            unmount = dispose;
+            ctx.inject(['remote.providerHub'], (nsCtx: any) => {
+              remote = nsCtx?.remote?.providerHub ?? null;
+            });
+          }, (error: unknown) => {
+            remoteError = error instanceof Error ? error.message : String(error);
+          });
+          return () => {
+            cancelled = true;
+            if (unmount !== undefined) void unmount();
+          };
+        }, 'dsh-provider-hub: remote mount');
       }
+    } catch {
+      remote = null;
     }
 
-    /** Unwrap the business envelope. NEVER throws: a failed/unavailable
-     *  remote returns `{ ok: false, error }` so React callers cannot crash
-     *  the renderer with an unhandled rejection. */
+    /** Unwrap the transport + business envelopes. NEVER throws: a failed or
+     *  unavailable remote returns `{ ok: false, error }` so React callers
+     *  cannot crash the renderer with an unhandled rejection. */
     const call: Call = async (method, payload) => {
       try {
-        if (remote === null) return { ok: false, error: t('remotePending') };
+        const ns = await waitForRemote();
+        if (ns === null) return { ok: false, error: remoteError ?? t('remotePending') };
         const remoteName = METHOD_MAP[method];
         if (remoteName === undefined) return { ok: false, error: `unknown method ${method}` };
         const args = (PARAM_ORDER[method] ?? []).map((key) => (payload ?? {})[key]);
-        const r = await remote[remoteName](...args);
+        const r = await ns[remoteName](...args);
         const msgOf = (e: unknown): string =>
           typeof e === 'string' ? e : (e !== null && typeof e === 'object' && typeof (e as { message?: unknown }).message === 'string' ? (e as { message: string }).message : '');
         if (r === null || typeof r !== 'object' || (r as { ok?: unknown }).ok !== true) {
           return { ok: false, error: msgOf((r as { error?: unknown })?.error) || t('callFailed') };
         }
-        return r as Record<string, unknown> & { ok: boolean };
+        // Transport envelope: { ok: true, value: <business envelope> }.
+        const value = (r as { value?: unknown }).value;
+        if (typeof value !== 'object' || value === null || (value as { ok?: unknown }).ok !== true) {
+          return { ok: false, error: msgOf((value as { error?: unknown })?.error) || t('callFailed') };
+        }
+        return value as Record<string, unknown> & { ok: boolean };
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
