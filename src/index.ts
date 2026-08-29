@@ -31,7 +31,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { LlmAdapter, LlmError, assertUsableApiKey } from '@deepseek-ai/dsh-llm';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment';
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings';
+import { settingsNamespace } from '@deepseek-ai/dsh-settings';
 import { GatewayAdapter } from './adapter.ts';
 import { MODEL_CATALOG, resolveModelEntries } from './catalog.ts';
 import { discoverModels } from './discovery.ts';
@@ -124,6 +124,10 @@ export const Config = z.object({
  */
 export function apply(ctx: Context, config: WireConfig) {
   let current: () => WireConfig = () => config;
+  // How many times the settings inject callback (re)bound `current`; a second
+  // bind while the plugin still runs would prove the settings fiber was
+  // disposed/recreated (the suspected "list empty" root cause).
+  let settingsBind = 0;
 
   /** Gateway by provider route (cached per current() call). */
   const gatewayFor = (provider: string): GatewayConfig | undefined =>
@@ -226,14 +230,87 @@ export function apply(ctx: Context, config: WireConfig) {
     }
   });
 
-  installSettingsSection(ctx, NS, Config, config, {
-    setSource: (source: () => WireConfig) => {
-      current = source;
-      ctx.logger.info('provider-hub: settings source bound (live config)');
-    },
-    onChange: () => {
-      ctx.logger.info(`provider-hub: settings changed, current gateways=${current().gateways.length}`);
-    },
+  // Settings wiring, mirroring official installSettingsSection semantics but
+  // under our own control so every read/write can be audited:
+  //   - `current` reads the namespace THROUGH settings.describe() on each call
+  //     (always the live registration's value + revision), falling back to the
+  //     owner scope, then to the composition entry;
+  //   - every commit rebinds `current` and logs a cross-check
+  //     (scope value vs describe value vs describe.user vs revision), which
+  //     pinpoints whether the cached resolved value, the map registration or
+  //     the raw user section drift apart — the "saved but list empty" bug.
+  ctx.inject(['settings'], (sctx) => {
+    try {
+      const s = sctx.settings as unknown as {
+        register(ns: string, schema: unknown, options?: { base?: unknown }): {
+          get(): WireConfig;
+          watch(cb: (next: unknown, prev: unknown) => void): () => void;
+        };
+        describe?(options?: { redactSecrets?: boolean }): Array<{
+          ns: string;
+          value?: unknown;
+          user?: unknown;
+          revision: number;
+        }>;
+      };
+      const scope = s.register(NS, Config, { base: config });
+      settingsBind += 1;
+      const bindMark = settingsBind;
+      /** Live read: describe() mirrors the current map registration; the
+       *  owner scope mirrors the cached resolved snapshot. describe wins —
+       *  it never serves a stale registration. */
+      const read = (): WireConfig => {
+        let live: unknown;
+        try {
+          const d = s.describe?.({ redactSecrets: true })?.find((c) => c.ns === NS);
+          live = d?.value;
+        } catch {
+          live = undefined;
+        }
+        if (live !== undefined && typeof live === 'object' && live !== null
+          && Array.isArray((live as { gateways?: unknown }).gateways)) {
+          return live as WireConfig;
+        }
+        return scope.get();
+      };
+      current = read;
+      ctx.logger.info(`provider-hub: settings source bound ${bindMark} (describe live read)`);
+      const report = (tag: string): void => {
+        let scopeCount = -1;
+        let descCount: number | undefined;
+        let userCount: number | undefined;
+        let revision: number | undefined;
+        try { scopeCount = scope.get().gateways.length; } catch { /* disposed */ }
+        try {
+          const d = s.describe?.({ redactSecrets: true })?.find((c) => c.ns === NS);
+          descCount = (d?.value as { gateways?: unknown[] } | undefined)?.gateways?.length;
+          userCount = (d?.user as { gateways?: unknown[] } | undefined)?.gateways?.length;
+          revision = d?.revision;
+        } catch { /* transient */ }
+        ctx.logger.info(
+          `provider-hub: ${tag} bind=${bindMark} scope=${scopeCount} describe=${String(descCount)} user=${String(userCount)} revision=${String(revision)}`,
+        );
+      };
+      report('settings setup');
+      // Every commit rebinds the live reader and cross-checks the views.
+      scope.watch(() => {
+        current = read;
+        report('settings watch');
+      });
+      // Settings fiber disposed while the plugin lives: fall back to the
+      // composition entry (the official installSettingsSection behaviour);
+      // log it — this path is the prime suspect for "saved but list empty".
+      sctx.effect(() => () => {
+        try {
+          const state = (ctx as { fiber?: { state?: number } }).fiber?.state ?? 0;
+          if (state === 4 || state === 5) return; // plugin itself unloading
+        } catch { /* keep logging */ }
+        current = () => config;
+        report('settings disposed');
+      });
+    } catch (error) {
+      ctx.logger.warn(`provider-hub: settings setup failed (entry fallback): ${error instanceof Error ? error.message : String(error)}`);
+    }
   });
 
   ctx.logger.info(

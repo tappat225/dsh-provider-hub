@@ -1,9 +1,12 @@
 /** Dictionaries for the Provider Hub settings page. */
 export const zh = {
   nav: 'Provider Hub',
+  intro: '统一管理网关路由、模型目录与模型发现；所有改动即时生效，无需手改 settings.yaml。',
   gateways: '网关列表',
   addGateway: '添加网关',
   gateway: '网关设置',
+  emptyTitle: '还没有网关',
+  emptyHint: '添加一个网关路由，配置上游端点后即可在 DSH 模型选择器中使用其模型。',
   providerName: '路由名',
   providerNameHint: '改动需重启',
   displayName: '显示名',
@@ -55,9 +58,12 @@ export const zh = {
 
 export const en: Record<keyof typeof zh, string> = {
   nav: 'Provider Hub',
+  intro: 'Manage gateway routes, model catalogs and model discovery. Every change applies live — no hand-editing settings.yaml.',
   gateways: 'Gateways',
   addGateway: 'Add gateway',
   gateway: 'Gateway',
+  emptyTitle: 'No gateways yet',
+  emptyHint: 'Add a gateway route, point it at an upstream endpoint, and its models become available in the DSH model picker.',
   providerName: 'Route name',
   providerNameHint: 'change requires restart',
   displayName: 'Display name',

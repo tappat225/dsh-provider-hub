@@ -34,8 +34,21 @@ interface ContextLike {
 
 /** Settings service surface used by the runtime. */
 interface SettingsLike {
-  mutate(ns: string, ops: unknown[]): Promise<unknown>;
+  mutate(ns: string, ops: unknown[], expectedRevision?: number): Promise<unknown>;
+  update?(ns: string, patch: Record<string, unknown>, expectedRevision?: number): Promise<unknown>;
+  describe?(options?: { redactSecrets?: boolean }): Array<{ ns: string; value?: unknown; user?: unknown; revision: number }>;
   writable?: boolean;
+}
+
+/** Namespace view of the settings document (what describe() reports). */
+interface SettingsView {
+  gateways?: unknown;
+  revision: number;
+}
+
+/** A settings write refused because the namespace moved since it was read. */
+function isSettingsConflict(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('SETTINGS_CONFLICT') || (error !== null && typeof error === 'object' && (error as { code?: unknown }).code === 'SETTINGS_CONFLICT');
 }
 
 /** LLM service surface used by the runtime. */
@@ -78,6 +91,39 @@ export class ProviderHubRuntime extends TypertRemoteService {
     return this.hostCtx.get<SettingsLike>('settings');
   }
 
+  /** Live namespace view (describe mirrors the current map registration). */
+  private view(): SettingsView | undefined {
+    try {
+      const s = this.settings();
+      const d = s?.describe?.({ redactSecrets: true })?.find((c) => c.ns === 'llm-provider-hub');
+      if (d === undefined) return undefined;
+      return { gateways: (d.value as { gateways?: unknown } | undefined)?.gateways, revision: d.revision };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Serialized settings write with revision guard: reads the current revision,
+   * applies the ops, retries ONCE on a namepsace conflict, and returns the
+   * post-write revision so the caller can verify the commit landed.
+   */
+  private async writeOps(st: SettingsLike, ops: Op[]): Promise<{ revision?: number; committed: boolean }> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const view = this.view();
+      try {
+        await st.mutate('llm-provider-hub', ops, view?.revision);
+        const after = this.view();
+        return { revision: after?.revision, committed: after !== undefined };
+      } catch (error) {
+        if (attempt === 0 && isSettingsConflict(error)) continue;
+        throw error;
+      }
+    }
+    // Unreachable: the loop returns on success or throws.
+    return { committed: false };
+  }
+
   private llm(): LlmLike | undefined {
     return this.hostCtx.get<LlmLike>('llm');
   }
@@ -96,7 +142,11 @@ export class ProviderHubRuntime extends TypertRemoteService {
   async getState(): Promise<Envelope> {
     try {
       const config = this.deps.current();
-      this.deps.log(`getState: current() gateways=${config.gateways.length} ${JSON.stringify(config.gateways.map((gw) => gw.provider))}`);
+      const view = this.view();
+      const liveG = Array.isArray(view?.gateways) ? (view.gateways as unknown[]).length : undefined;
+      this.deps.log(
+        `getState: current()=${config.gateways.length} describe=${String(liveG)} scope-user=${String(Array.isArray(view?.gateways) ? (view.gateways as unknown[]).length : 'n/a')} revision=${String(view?.revision)}`,
+      );
       return ok({
         config,
         gateways: config.gateways.map((gw, index) => ({
@@ -119,7 +169,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
       if (st === undefined) return fail('settings service unavailable');
       if (st.writable === false) return fail('settings are read-only');
       const config = this.deps.current();
-      this.deps.log(`addGateway: before mutate current() gateways=${config.gateways.length}`);
+      this.deps.log(`addGateway: before mutate current()=${config.gateways.length} describe=${String(this.view()?.revision)}`);
       const used = new Set(config.gateways.map((gw) => gw.provider));
       let base = 'hub-gateway';
       let provider = base;
@@ -141,9 +191,12 @@ export class ProviderHubRuntime extends TypertRemoteService {
       };
       const ops: Op[] = [{ op: 'set', path: ['gateways'], value: [...config.gateways, gw] }];
       const index = config.gateways.length;
-      await st.mutate('llm-provider-hub', ops);
+      const committed = await this.writeOps(st, ops);
       const after = this.deps.current();
-      this.deps.log(`addGateway: after mutate current() gateways=${after.gateways.length} ${JSON.stringify(after.gateways.map((g) => g.provider))}`);
+      const afterView = this.view();
+      this.deps.log(
+        `addGateway: after current()=${after.gateways.length} describe=${String(Array.isArray(afterView?.gateways) ? (afterView.gateways as unknown[]).length : 'n/a')} revision=${String(afterView?.revision)} committed=${String(committed.committed)}`,
+      );
       return ok({ index, gateway: gw });
     } catch (error) {
       return fail(error);
@@ -159,7 +212,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
       const config = this.deps.current();
       if (index < 0 || index >= config.gateways.length) return fail('gateway index out of range');
       const next = config.gateways.filter((_, i) => i !== index);
-      await st.mutate('llm-provider-hub', [{ op: 'set', path: ['gateways'], value: next }]);
+      await this.writeOps(st, [{ op: 'set', path: ['gateways'], value: next }]);
       return ok({ removed: index, gateways: next.length });
     } catch (error) {
       return fail(error);
@@ -174,8 +227,8 @@ export class ProviderHubRuntime extends TypertRemoteService {
       if (st.writable === false) return fail('settings are read-only');
       const gw = this.gatewayAt(index);
       if (gw === undefined) return fail('gateway index out of range');
-      const ops = Object.entries(patch).map(([key, value]) => ({ op: 'set', path: this.path(index, key), value }));
-      await st.mutate('llm-provider-hub', ops);
+      const ops = Object.entries(patch).map(([key, value]) => ({ op: 'set' as const, path: this.path(index, key), value }));
+      await this.writeOps(st, ops);
       return ok({ config: this.deps.current() });
     } catch (error) {
       return fail(error);
@@ -196,7 +249,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
           if (existingSnapshot === undefined || existingSnapshot.enabledModels.length === 0) {
             const st = this.settings();
             if (st !== undefined) {
-              await st.mutate('llm-provider-hub', [{
+              await this.writeOps(st, [{
                 op: 'set', path: this.path(index, 'catalogSnapshot'), value: {
                   enabledModels: [...(gw.enabledModels ?? [])],
                   customModels: [...(gw.customModels ?? [])],
@@ -264,7 +317,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
       const ops = preset === null
         ? [{ op: 'unset', path: this.path(index, 'presetFrom') }]
         : [{ op: 'set', path: this.path(index, 'presetFrom'), value: preset }];
-      await st.mutate('llm-provider-hub', ops);
+      await this.writeOps(st, ops as Op[]);
       return ok({});
     } catch (error) {
       return fail(error);
@@ -343,7 +396,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
         enabledModels: [...(gw.enabledModels ?? [])],
         customModels: [...(gw.customModels ?? [])],
       };
-      await st.mutate('llm-provider-hub', [{ op: 'set', path: this.path(index, 'catalogSnapshot'), value: snapshot }]);
+      await this.writeOps(st, [{ op: 'set', path: this.path(index, 'catalogSnapshot'), value: snapshot }]);
       return ok({ snapshot });
     } catch (error) {
       return fail(error);
@@ -361,7 +414,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
       if (snapshot === undefined || (snapshot.enabledModels.length === 0 && snapshot.customModels.length === 0)) {
         return fail('no catalog snapshot to restore');
       }
-      await st.mutate('llm-provider-hub', [
+      await this.writeOps(st, [
         { op: 'set', path: this.path(index, 'enabledModels'), value: snapshot.enabledModels },
         { op: 'set', path: this.path(index, 'customModels'), value: snapshot.customModels },
       ]);
@@ -390,7 +443,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
       const shouldSnapshot = existingSnapshot === undefined
         || (existingSnapshot.enabledModels.length === 0 && existingSnapshot.customModels.length === 0);
       if (shouldSnapshot) {
-        await st.mutate('llm-provider-hub', [{
+        await this.writeOps(st, [{
           op: 'set', path: this.path(index, 'catalogSnapshot'), value: {
             enabledModels: [...(gw.enabledModels ?? [])],
             customModels: [...(gw.customModels ?? [])],
@@ -414,7 +467,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
           overrides[id] = next;
           ops.push({ op: 'set', path: this.path(index, 'modelOverrides'), value: overrides });
         }
-        await st.mutate('llm-provider-hub', ops as never[]);
+        await this.writeOps(st, ops as Op[]);
         return ok({ enabled: id, kind: 'builtin' });
       }
       // Non-catalog: insert as custom model.
@@ -427,7 +480,7 @@ export class ProviderHubRuntime extends TypertRemoteService {
         maxTokens: typeof model.maxTokens === 'number' && Number.isFinite(model.maxTokens) ? model.maxTokens : 8192,
       };
       custom.push(entry);
-      await st.mutate('llm-provider-hub', [{ op: 'set', path: this.path(index, 'customModels'), value: custom }]);
+      await this.writeOps(st, [{ op: 'set', path: this.path(index, 'customModels'), value: custom }]);
       return ok({ enabled: id, kind: 'custom' });
     } catch (error) {
       return fail(error);

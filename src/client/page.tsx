@@ -3,8 +3,10 @@
  * Environment-neutral: driven only by `t` (translate) and `call` (one host
  * RPC returning `{ ok, ... } | { ok: false, error }`).
  *
- * Layout: a list of gateway cards; clicking one expands its full editor
- * (gateway fields + model management). All mutations carry the gateway index.
+ * Layout (DSH settings design recipe — dsh-better-sidebar style): an intro
+ * line, a gateway-list group card (rows with icon chip + title/desc, a dashed
+ * add card), and per-gateway editor/model groups with DSH switch rows.
+ * All mutations carry the gateway index.
  *
  * @module dsh-provider-hub/client/page
  */
@@ -48,6 +50,55 @@ interface DiscoveredModel {
   maxTokens?: number;
 }
 
+// ---- Small presentational helpers (DSH settings recipe) ----
+
+interface RowProps {
+  title: ReactTypes.ReactNode;
+  desc?: ReactTypes.ReactNode;
+  control?: ReactTypes.ReactNode;
+  selected?: boolean;
+  onClick?: () => void;
+  className?: string;
+  key?: string | number;
+}
+
+/** One settings row: title/desc left, control right, hairline separators. */
+function Row(props: RowProps): ReactTypes.ReactElement {
+  const cls = ['phub-row'];
+  if (props.onClick !== undefined) cls.push('phub-clickable');
+  if (props.selected === true) cls.push('phub-row-selected');
+  if (props.className !== undefined) cls.push(props.className);
+  return React.createElement('div', { key: props.key, className: cls.join(' '), onClick: props.onClick },
+    React.createElement('div', { className: 'phub-rowText' },
+      React.createElement('span', { className: 'phub-rowTitle' }, props.title),
+      props.desc === undefined ? null : React.createElement('span', { className: 'phub-rowDesc' }, props.desc),
+    ),
+    props.control === undefined ? null : React.createElement('span', { className: 'phub-control' }, props.control),
+  );
+}
+
+/** DSH-style switch: hidden checkbox + 36x20 track with sliding thumb. */
+function SwitchUI(props: { checked: boolean; onChange: (next: boolean) => void; disabled?: boolean }): ReactTypes.ReactElement {
+  return React.createElement('label', { className: 'phub-switch' },
+    React.createElement('input', {
+      type: 'checkbox',
+      className: 'phub-switch-input',
+      checked: props.checked,
+      disabled: props.disabled === true,
+      onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => props.onChange(e.target.checked),
+    }),
+    React.createElement('span', { className: 'phub-switch-track' },
+      React.createElement('span', { className: 'phub-switch-thumb' }),
+    ),
+  );
+}
+
+/** Small uppercase icon chip (first letter of the gateway display name). */
+function ChipUI(props: { text: string }): ReactTypes.ReactElement {
+  const ch = (props.text || '?').charAt(0);
+  return React.createElement('span', { className: 'phub-icon-chip' }, ch);
+}
+
 const REASONING_PRESETS = [
   'off', 'low', 'medium', 'high', 'xhigh', 'max',
 ];
@@ -79,7 +130,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       const nextOverrides: Record<number, string> = {};
       const nextHeaders: Record<number, string> = {};
       for (const g of value.gateways) {
-        nextCustom[g.index] = (g.gateway.customModels as Array<Record<string, unknown>> | undefined ?? []).map((m) => ({
+        nextCustom[g.index] = ((g.gateway.customModels as Array<Record<string, unknown>> | undefined) ?? []).map((m) => ({
           id: String(m.id ?? ''),
           name: String(m.name ?? ''),
           contextWindow: String(m.contextWindow ?? ''),
@@ -133,6 +184,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         return false;
       }
       setStatus({ kind: 'ok', text: success });
+      void refresh();
       return true;
     } finally {
       setBusy(false);
@@ -150,13 +202,18 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
 
   const addGateway = () => {
     void (async () => {
-      const r = await call('add-gateway', {});
-      if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
-      else {
-        const index = (r as unknown as { index: number }).index;
-        setStatus({ kind: 'ok', text: t('saved') });
-        void refresh();
-        setState((s) => ({ ...s, selected: index }));
+      setBusy(true);
+      try {
+        const r = await call('add-gateway', {});
+        if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
+        else {
+          const index = (r as unknown as { index: number }).index;
+          setStatus({ kind: 'ok', text: t('saved') });
+          void refresh();
+          setState((s) => ({ ...s, selected: index }));
+        }
+      } finally {
+        setBusy(false);
       }
     })();
   };
@@ -346,209 +403,262 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     }
   };
 
-  const field = (key: string, label: string, hint?: string, placeholder?: string) => {
+  /** One editor field as a settings row (title/desc left, input right). */
+  const fieldRow = (key: string, label: string, hint?: string, placeholder?: string) => {
     const selected = state.selected;
     const entry = state.gateways.find((g) => g.index === selected);
     const cfg = entry?.gateway ?? {};
-    return React.createElement('div', { className: 'phub-field', key },
-      React.createElement('label', null, label),
-      React.createElement('input', {
+    return Row({
+      title: label,
+      desc: hint,
+      control: React.createElement('input', {
+        className: 'phub-input',
         value: String(cfg[key] ?? ''),
         placeholder,
-        onChange: (e: React.ChangeEvent<HTMLInputElement>) => setField(key, e.target.value),
+        onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setField(key, e.target.value),
       }),
-      hint === undefined ? null : React.createElement('span', { className: 'phub-hint' }, hint),
-    );
+    });
   };
 
   const selected = state.selected;
   const selectedEntry = state.gateways.find((g) => g.index === selected);
   const cfg = selectedEntry?.gateway ?? {};
+  const statusLine = status === null ? null
+    : React.createElement('span', { className: `phub-status phub-status-${status.kind}` }, status.text);
 
   return React.createElement('div', { className: 'phub-page' },
+    React.createElement('p', { className: 'phub-intro' }, t('intro')),
+
     // ---- Gateway list ----
-    React.createElement('section', { className: 'phub-section' },
-      React.createElement('h3', null, t('gateways')),
-      state.gateways.length === 0
-        ? React.createElement('span', { className: 'phub-hint' }, t('empty'))
-        : state.gateways.map((g) => React.createElement('div', {
-          key: g.index,
-          className: `phub-gw-item${selected === g.index ? ' phub-gw-item-selected' : ''}`,
-        },
-          React.createElement('button', {
-            className: 'phub-gw-name',
-            onClick: () => setState((s) => ({ ...s, selected: s.selected === g.index ? null : g.index })),
-          },
-            `${String(g.gateway.displayName ?? g.gateway.provider ?? '')} (${String(g.gateway.provider ?? '')})`,
-          ),
-          React.createElement('span', { className: 'phub-hint' },
-            `${String(g.gateway.api ?? '')}${g.gateway.baseURL ? ` · ${String(g.gateway.baseURL)}` : ''}`,
-          ),
-          React.createElement('button', { className: 'phub-btn phub-gw-del', onClick: () => deleteGateway(g.index) }, t('delete')),
-        )),
-      React.createElement('div', { className: 'phub-actions' },
-        React.createElement('button', { className: 'phub-btn', onClick: addGateway }, `+ ${t('addGateway')}`),
-        // Surface operation outcomes (success/failure) even before any
-        // gateway is selected; otherwise a failed call looks like a dead
-        // button (the editor status line only renders when selected != null).
-        status === null ? null : React.createElement('span', { className: `phub-status ${status.kind}` }, status.text),
+    React.createElement('section', null,
+      React.createElement('div', { className: 'phub-group-heading' },
+        t('gateways'),
+        React.createElement('span', { className: 'phub-count' }, String(state.gateways.length)),
+      ),
+      React.createElement('div', { className: 'phub-group' },
+        state.gateways.length === 0
+          ? React.createElement('div', { className: 'phub-empty' },
+            React.createElement('span', { className: 'phub-empty-title' }, t('emptyTitle')),
+            React.createElement('span', { className: 'phub-empty-desc' }, t('emptyHint')),
+          )
+          : state.gateways.map((g) => {
+            const name = String(g.gateway.displayName ?? g.gateway.provider ?? '');
+            const provider = String(g.gateway.provider ?? '');
+            const api = String(g.gateway.api ?? '');
+            const base = String(g.gateway.baseURL ?? '');
+            const desc = base === '' ? `${provider} · ${api} · ${t('baseURL')} —` : `${provider} · ${api} · ${base}`;
+            return Row({
+              key: g.index,
+              selected: selected === g.index,
+              onClick: () => setState((s) => ({ ...s, selected: s.selected === g.index ? null : g.index })),
+              title: React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 10 } },
+                ChipUI({ text: name }),
+                React.createElement('span', null, name),
+              ),
+              desc,
+              control: React.createElement('button', {
+                className: 'phub-btn phub-btn-danger',
+                title: t('delete'),
+                onClick: (e: ReactTypes.MouseEvent<HTMLButtonElement>) => {
+                  e.stopPropagation();
+                  deleteGateway(g.index);
+                },
+              }, t('delete')),
+            });
+          }),
+        React.createElement('button', { className: 'phub-add-card', disabled: busy, onClick: addGateway },
+          `+ ${t('addGateway')}`,
+        ),
+        statusLine === null ? null : React.createElement('div', { className: 'phub-actions' }, statusLine),
       ),
     ),
-    // ---- Per-gateway editor ----
-    selected === null || selectedEntry === undefined ? null : React.createElement('section', { className: 'phub-section' },
-      React.createElement('h3', null, `${t('gateway')}: ${String(cfg.displayName ?? cfg.provider ?? '')}`),
-      React.createElement('div', { className: 'phub-grid' },
-        field('provider', t('providerName'), t('providerNameHint')),
-        field('displayName', t('displayName')),
-        field('baseURL', `${t('baseURL')} *`, undefined, t('baseURLPlaceholder')),
-        React.createElement('div', { className: 'phub-field' },
-          React.createElement('label', null, t('api')),
-          React.createElement('select', {
+
+    // ---- Gateway editor ----
+    selected === null || selectedEntry === undefined ? null : React.createElement('section', null,
+      React.createElement('div', { className: 'phub-group-heading' },
+        `${t('gateway')}: ${String(cfg.displayName ?? cfg.provider ?? '')}`,
+        React.createElement('span', { className: 'phub-count' }, String(cfg.api ?? 'anthropic-messages')),
+      ),
+      React.createElement('div', { className: 'phub-group' },
+        fieldRow('provider', t('providerName'), t('providerNameHint')),
+        fieldRow('displayName', t('displayName')),
+        fieldRow('baseURL', `${t('baseURL')} *`, undefined, t('baseURLPlaceholder')),
+        Row({
+          title: t('api'),
+          control: React.createElement('select', {
+            className: 'phub-select',
             value: String(cfg.api ?? 'anthropic-messages'),
-            onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setField('api', e.target.value),
+            onChange: (e: ReactTypes.ChangeEvent<HTMLSelectElement>) => setField('api', e.target.value),
           },
           React.createElement('option', { value: 'anthropic-messages' }, 'anthropic-messages'),
           React.createElement('option', { value: 'openai-completions' }, 'openai-completions'),
           ),
-        ),
-        field('userAgent', t('userAgent')),
-        React.createElement('div', { className: 'phub-field' },
-          React.createElement('label', null, t('systemRole')),
-          React.createElement('select', {
+        }),
+        Row({
+          title: t('systemRole'),
+          control: React.createElement('select', {
+            className: 'phub-select',
             value: String(cfg.systemRole ?? 'system'),
-            onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setField('systemRole', e.target.value),
+            onChange: (e: ReactTypes.ChangeEvent<HTMLSelectElement>) => setField('systemRole', e.target.value),
           },
           React.createElement('option', { value: 'system' }, 'system'),
           React.createElement('option', { value: 'developer' }, 'developer'),
           ),
-        ),
-        field('apiKey', t('apiKey')),
-        field('apiKeyEnv', t('apiKeyEnv'), t('apiKeyHint')),
-        React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-          React.createElement('input', {
-            type: 'checkbox',
+        }),
+        fieldRow('userAgent', t('userAgent')),
+        fieldRow('apiKey', t('apiKey')),
+        fieldRow('apiKeyEnv', t('apiKeyEnv'), t('apiKeyHint')),
+        Row({
+          title: t('anthropicThinking'),
+          control: SwitchUI({
             checked: Boolean(cfg.anthropicThinking),
-            onChange: (e: React.ChangeEvent<HTMLInputElement>) => setField('anthropicThinking', e.target.checked),
+            onChange: (next) => setField('anthropicThinking', next),
           }),
-          t('anthropicThinking'),
-        ),
-      ),
-      React.createElement('div', { className: 'phub-field phub-headers' },
-        React.createElement('label', null, `${t('extraHeaders')} (JSON)`),
-        React.createElement('textarea', {
-          value: headersText[selected] ?? '',
-          onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => setHeadersText((h) => ({ ...h, [selected]: e.target.value })),
         }),
-      ),
-      React.createElement('div', { className: 'phub-actions' },
-        React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void save() }, t('save')),
-        status === null ? null : React.createElement('span', { className: `phub-status ${status.kind}` }, status.text),
-      ),
-      // ---- Models ----
-      React.createElement('h3', { style: { marginTop: 16 } }, t('models')),
-      React.createElement('div', { className: 'phub-builtin' },
-        React.createElement('span', { className: 'phub-hint' }, t('builtinHint')),
-        Object.entries(state.catalog).map(([id, entry]) => React.createElement('label', { key: id },
-          React.createElement('input', {
-            type: 'checkbox',
-            checked: (cfg.enabledModels as string[] | undefined ?? []).includes(id),
-            onChange: (e: React.ChangeEvent<HTMLInputElement>) => toggleBuiltin(id, e.target.checked),
+        Row({
+          title: `${t('extraHeaders')} (JSON)`,
+          control: React.createElement('textarea', {
+            className: 'phub-textarea',
+            style: { width: 320 },
+            value: headersText[selected] ?? '',
+            onChange: (e: ReactTypes.ChangeEvent<HTMLTextAreaElement>) => setHeadersText((h) => ({ ...h, [selected]: e.target.value })),
           }),
-          React.createElement('span', null, entry.name),
-          React.createElement('span', { className: 'phub-params' }, `${entry.contextWindow} / ${entry.maxTokens}`),
-        )),
-      ),
-      React.createElement('div', { className: 'phub-field phub-overrides', style: { marginTop: 10 } },
-        React.createElement('label', null, `${t('overrides')} (JSON)`),
-        React.createElement('textarea', {
-          value: overridesText[selected] ?? '',
-          onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => setOverridesText((o) => ({ ...o, [selected]: e.target.value })),
         }),
         React.createElement('div', { className: 'phub-actions' },
-          React.createElement('button', { className: 'phub-btn', onClick: saveOverrides }, t('save')),
+          React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void save() }, t('save')),
+          statusLine,
         ),
       ),
-      React.createElement('div', { className: 'phub-custom', style: { marginTop: 12 } },
-        React.createElement('label', null, t('custom')),
-        ((customRows[selected] ?? []).length === 0 ? React.createElement('span', { className: 'phub-hint' }, t('empty')) : null),
-        (customRows[selected] ?? []).map((row, rowIndex) => React.createElement('div', { className: 'phub-custom-item', key: rowIndex },
-          React.createElement('input', {
-            placeholder: t('modelId'),
-            value: row.id,
-            onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
-              const next = [...(customRows[selected] ?? [])];
-              next[rowIndex] = { ...row, id: e.target.value };
-              setCustomRows((rows) => ({ ...rows, [selected]: next }));
-            },
+    ),
+
+    // ---- Models ----
+    selected === null || selectedEntry === undefined ? null : React.createElement('section', null,
+      React.createElement('div', { className: 'phub-group-heading' },
+        t('models'),
+        React.createElement('span', { className: 'phub-count' },
+          String(((cfg.enabledModels as string[] | undefined) ?? []).length),
+        ),
+      ),
+      React.createElement('div', { className: 'phub-group' },
+        React.createElement('div', { className: 'phub-editor-note', style: { paddingTop: 10 } }, t('builtinHint')),
+        React.createElement('div', { className: 'phub-models-list', style: { marginTop: 4 } },
+          Object.entries(state.catalog).map(([id, entry]) => Row({
+            key: id,
+            title: entry.name,
+            desc: React.createElement('span', { className: 'phub-model-params' }, `${entry.contextWindow} · ${entry.maxTokens}`),
+            control: SwitchUI({
+              checked: ((cfg.enabledModels as string[] | undefined) ?? []).includes(id),
+              onChange: (next) => toggleBuiltin(id, next),
+            }),
+          })),
+        ),
+        Row({
+          title: `${t('overrides')} (JSON)`,
+          desc: t('overridesHint'),
+          control: React.createElement('textarea', {
+            className: 'phub-textarea',
+            style: { width: 320 },
+            value: overridesText[selected] ?? '',
+            onChange: (e: ReactTypes.ChangeEvent<HTMLTextAreaElement>) => setOverridesText((o) => ({ ...o, [selected]: e.target.value })),
           }),
-          React.createElement('input', {
-            placeholder: t('modelName'),
-            value: row.name,
-            onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
-              const next = [...(customRows[selected] ?? [])];
-              next[rowIndex] = { ...row, name: e.target.value };
-              setCustomRows((rows) => ({ ...rows, [selected]: next }));
-            },
-          }),
-          React.createElement('input', {
-            placeholder: t('contextWindow'),
-            value: row.contextWindow,
-            onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
-              const next = [...(customRows[selected] ?? [])];
-              next[rowIndex] = { ...row, contextWindow: e.target.value };
-              setCustomRows((rows) => ({ ...rows, [selected]: next }));
-            },
-          }),
-          React.createElement('input', {
-            placeholder: t('maxTokens'),
-            value: row.maxTokens,
-            onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
-              const next = [...(customRows[selected] ?? [])];
-              next[rowIndex] = { ...row, maxTokens: e.target.value };
-              setCustomRows((rows) => ({ ...rows, [selected]: next }));
-            },
-          }),
-          React.createElement('button', { className: 'phub-btn', onClick: () => void saveCustomRow(rowIndex) }, t('save')),
-          React.createElement('button', { className: 'phub-btn', onClick: () => void deleteCustomRow(row.id) }, t('delete')),
-        )),
+        }),
         React.createElement('div', { className: 'phub-actions' },
-          React.createElement('button', { className: 'phub-btn', onClick: addCustomRow }, `+ ${t('addCustom')}`),
+          React.createElement('button', { className: 'phub-btn', onClick: saveOverrides }, `${t('overrides')}: ${t('save')}`),
         ),
-      ),
-      React.createElement('div', { className: 'phub-preset', style: { marginTop: 12 } },
-        React.createElement('span', { className: 'phub-hint' }, t('presetHint')),
-        React.createElement('select', {
-          value: presetProvider[selected] ?? '',
-          onChange: (e: React.ChangeEvent<HTMLSelectElement>) => void loadPresetModels(e.target.value),
-        },
-        React.createElement('option', { value: '' }, '—'),
-        presetProviders.map((p) => React.createElement('option', { key: p.provider, value: p.provider }, `${p.displayName} (${p.provider})`)),
-        ),
-        React.createElement('select', {
-          value: presetModel[selected] ?? '',
-          disabled: (presetModels[selected] ?? []).length === 0,
-          onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setPresetModel((p) => ({ ...p, [selected]: e.target.value })),
-        },
-        React.createElement('option', { value: '' }, '—'),
-        (presetModels[selected] ?? []).map((m) => React.createElement('option', { key: m.id, value: m.id }, m.name ?? m.id)),
-        ),
-        React.createElement('button', { className: 'phub-btn', disabled: (presetModel[selected] ?? '') === '', onClick: () => void importPreset() }, t('importPreset')),
-      ),
-      React.createElement('div', { className: 'phub-actions', style: { marginTop: 12 } },
-        React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void runDiscover() }, t('discover')),
-        React.createElement('span', { className: 'phub-hint' }, t('discoverHint')),
-      ),
-      React.createElement('div', { className: 'phub-actions', style: { marginTop: 8 } },
-        React.createElement('button', { className: 'phub-btn', onClick: () => void snapshotCatalog() }, t('snapshot')),
-        React.createElement('button', { className: 'phub-btn', onClick: () => void restoreCatalog() }, t('restore')),
-        React.createElement('span', { className: 'phub-hint' }, t('snapshotHint')),
-      ),
-      discovered[selected] === null || discovered[selected] === undefined ? null : React.createElement('div', { className: 'phub-discover-list' },
-        (discovered[selected] ?? []).map((model) => React.createElement('div', { className: 'phub-discover-item', key: model.id },
-          React.createElement('span', null, `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}`),
-          React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
-          React.createElement('button', { className: 'phub-btn', onClick: () => void adoptDiscovered(model) }, t('adopt')),
+        Row({
+          title: t('custom'),
+          desc: (customRows[selected] ?? []).length === 0 ? t('empty') : undefined,
+          control: React.createElement('button', { className: 'phub-btn', onClick: addCustomRow }, `+ ${t('addCustom')}`),
+        }),
+        ((customRows[selected] ?? []).length === 0 ? null : (customRows[selected] ?? []).map((row, rowIndex) =>
+          React.createElement('div', { className: 'phub-custom-item', key: rowIndex },
+            React.createElement('input', {
+              className: 'phub-input',
+              placeholder: t('modelId'),
+              value: row.id,
+              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
+                const next = [...(customRows[selected] ?? [])];
+                next[rowIndex] = { ...row, id: e.target.value };
+                setCustomRows((rows) => ({ ...rows, [selected]: next }));
+              },
+            }),
+            React.createElement('input', {
+              className: 'phub-input',
+              placeholder: t('modelName'),
+              value: row.name,
+              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
+                const next = [...(customRows[selected] ?? [])];
+                next[rowIndex] = { ...row, name: e.target.value };
+                setCustomRows((rows) => ({ ...rows, [selected]: next }));
+              },
+            }),
+            React.createElement('input', {
+              className: 'phub-input',
+              placeholder: t('contextWindow'),
+              value: row.contextWindow,
+              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
+                const next = [...(customRows[selected] ?? [])];
+                next[rowIndex] = { ...row, contextWindow: e.target.value };
+                setCustomRows((rows) => ({ ...rows, [selected]: next }));
+              },
+            }),
+            React.createElement('input', {
+              className: 'phub-input',
+              placeholder: t('maxTokens'),
+              value: row.maxTokens,
+              onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
+                const next = [...(customRows[selected] ?? [])];
+                next[rowIndex] = { ...row, maxTokens: e.target.value };
+                setCustomRows((rows) => ({ ...rows, [selected]: next }));
+              },
+            }),
+            React.createElement('button', { className: 'phub-btn', onClick: () => void saveCustomRow(rowIndex) }, t('save')),
+            React.createElement('button', { className: 'phub-btn', onClick: () => void deleteCustomRow(row.id) }, t('delete')),
+          ),
         )),
+        Row({
+          title: t('presetFrom'),
+          desc: t('presetHint'),
+          control: React.createElement('span', { className: 'phub-control' },
+            React.createElement('select', {
+              className: 'phub-select',
+              value: presetProvider[selected] ?? '',
+              onChange: (e: ReactTypes.ChangeEvent<HTMLSelectElement>) => void loadPresetModels(e.target.value),
+            },
+            React.createElement('option', { value: '' }, '—'),
+            presetProviders.map((p) => React.createElement('option', { key: p.provider, value: p.provider }, `${p.displayName} (${p.provider})`)),
+            ),
+            React.createElement('select', {
+              className: 'phub-select',
+              value: presetModel[selected] ?? '',
+              disabled: (presetModels[selected] ?? []).length === 0,
+              onChange: (e: ReactTypes.ChangeEvent<HTMLSelectElement>) => setPresetModel((p) => ({ ...p, [selected]: e.target.value })),
+            },
+            React.createElement('option', { value: '' }, '—'),
+            (presetModels[selected] ?? []).map((m) => React.createElement('option', { key: m.id, value: m.id }, m.name ?? m.id)),
+            ),
+            React.createElement('button', { className: 'phub-btn', disabled: (presetModel[selected] ?? '') === '', onClick: () => void importPreset() }, t('importPreset')),
+          ),
+        }),
+        React.createElement('div', { className: 'phub-actions' },
+          React.createElement('button', { className: 'phub-btn', disabled: busy, onClick: () => void runDiscover() }, t('discover')),
+          React.createElement('span', { className: 'phub-editor-note' }, t('discoverHint')),
+        ),
+        React.createElement('div', { className: 'phub-actions' },
+          React.createElement('button', { className: 'phub-btn', onClick: () => void snapshotCatalog() }, t('snapshot')),
+          React.createElement('button', { className: 'phub-btn', onClick: () => void restoreCatalog() }, t('restore')),
+          React.createElement('span', { className: 'phub-editor-note' }, t('snapshotHint')),
+        ),
+        discovered[selected] === null || discovered[selected] === undefined ? null
+          : React.createElement('div', { className: 'phub-discover-list' },
+            (discovered[selected] ?? []).map((model) => React.createElement('div', { className: 'phub-discover-item', key: model.id },
+              React.createElement('span', null,
+                `${model.id}${model.contextWindow !== undefined ? ` · ${model.contextWindow}` : ''}${model.maxTokens !== undefined ? ` / ${model.maxTokens}` : ''}`,
+              ),
+              React.createElement('button', { className: 'phub-btn', onClick: () => void enableDiscovered(model) }, t('enable')),
+              React.createElement('button', { className: 'phub-btn', onClick: () => void adoptDiscovered(model) }, t('adopt')),
+            )),
+          ),
       ),
     ),
   );
