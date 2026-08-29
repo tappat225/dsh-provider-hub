@@ -9,12 +9,12 @@
  * @module dsh-provider-hub/client/page
  */
 import type * as ReactTypes from 'react';
+// Real value import: the DSH client module system resolves `react` through
+// its platform seed table, so the built bundle calls require("react") and
+// gets the renderer's React instance (no global dependency).
+import React from 'react';
 import css from './page.css.ts';
 import { zh, en } from './locales.ts';
-
-// React is provided as a global by the DSH client runtime; this declaration
-// only types it (erased at build time — the bundle uses React.createElement).
-declare const React: typeof ReactTypes;
 
 export type Translate = (key: string) => string;
 export type Call = (method: string, payload?: Record<string, unknown>) => Promise<Record<string, unknown> & { ok: boolean }>;

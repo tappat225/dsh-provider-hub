@@ -35,7 +35,7 @@
   "scripts": {
     "build": "node build.mjs && tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "node test/plugin.test.mjs",
+    "test": "node test/plugin.test.mjs && node test/client-loader.test.mjs",
     "check": "npm run typecheck && npm run build && npm test"
   },
   "keywords": [

@@ -10,10 +10,11 @@
  * @module dsh-provider-hub/client/static
  */
 import type * as ReactTypes from 'react';
+// Real value import: the DSH client module system resolves `react` through
+// its platform seed table, so the built bundle calls require("react") and
+// gets the renderer's React instance (no global dependency).
+import React from 'react';
 import { ProviderHubPage, css, zh, en, type Translate, type Call } from './page.tsx';
-
-// React is provided as a global by the DSH client runtime.
-declare const React: typeof ReactTypes;
 
 export const name = 'provider-hub';
 /** No hard inject: every dependency is acquired defensively at apply time. */

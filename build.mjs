@@ -1,7 +1,8 @@
 // Bundle both halves of dsh-provider-hub:
-//   - host:  src/index.ts            -> lib/index.js  (ESM, node)
-//   - client: src/client/static.tsx  -> lib/client.js (ModuleLoader CJS, browser)
-// @deepseek-ai/* stays external (provided by the DSH profile at runtime).
+//   - host:  src/index.ts           -> lib/index.js  (ESM, node)
+//   - client: src/client/static.tsx -> lib/client.js (ModuleLoader CJS, browser)
+// @deepseek-ai/* and react stay external (the DSH profile / the renderer's
+// client module-system seed table provide them at runtime).
 import { build } from 'esbuild';
 
 const host = await build({
@@ -16,7 +17,21 @@ const host = await build({
   logLevel: 'info',
 });
 
+const CLIENT_LOADER_ID = 'dsh-provider-hub';
+
 const client = await build({
+  // DSH's client module system (@deepseek-ai/dsh-client-modules) requires
+  // every `dsh.client` bundle to register through
+  // `window.__ModuleLoader__.load({ id, factory })`. The factory receives the
+  // module system's require (seed words such as `react`) and must return the
+  // plugin exports. Without this wrapper the web boot fails with "entries
+  // did not activate" and Desktop enters recovery mode.
+  //
+  // The banner/footer wrap the whole CJS output inside the factory, so the
+  // emitted `require("react")` calls resolve against the factory parameter
+  // (no top-level require in the browser). `id` must equal the loader entry
+  // name of the package (cordis.patch.yml `name`), the id the boot graph
+  // advertises under /plugins/<id>/client.js.
   entryPoints: ['src/client/static.tsx'],
   bundle: true,
   format: 'cjs',
@@ -29,7 +44,13 @@ const client = await build({
   jsxFragment: 'React.Fragment',
   outfile: 'lib/client.js',
   sourcemap: true,
-  external: ['@deepseek-ai/*'],
+  external: ['@deepseek-ai/*', 'react'],
+  banner: {
+    js: `window.__ModuleLoader__.load({\n  id: ${JSON.stringify(CLIENT_LOADER_ID)},\n  factory: (require) => {\n    var module = { exports: {} };\n    var exports = module.exports;\n`,
+  },
+  footer: {
+    js: `\n    return module.exports;\n  }\n});\n`,
+  },
   logLevel: 'info',
 });
 
