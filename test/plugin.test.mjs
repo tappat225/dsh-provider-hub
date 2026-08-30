@@ -1,6 +1,7 @@
 // Verify dsh-provider-hub (multi-gateway): Config schema, adapter catalog/resolve,
 // stream conversion (anthropic + openai paths), model discovery, multi-gateway
-// isolation, and a live probe through the UA gate.
+// isolation, and offline wire probes through the UA gate (localhost echo
+// server only — no real network).
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { BlockAssembler, LlmError } from '@deepseek-ai/dsh-llm';
@@ -53,6 +54,16 @@ const config = plugin.Config({
 });
 check('Config defaults', config.gateways[0].provider === 'air-outer' && config.gateways[0].userAgent === 'claude-cli/2.0.1 (external, cli)');
 check('Config customModels kept', config.gateways[0].customModels.length === 1);
+const defaultModelConfig = plugin.Config({ gateways: [{
+  provider: 'defaults-gw',
+  baseURL: 'http://127.0.0.1:18996',
+  defaultContextWindow: 65536,
+  defaultMaxTokens: 4096,
+  defaultInput: ['image'],
+  customModels: [{ id: 'defaulted-model', name: 'Defaulted Model' }],
+}] }).gateways[0];
+const defaultedEntry = plugin.resolveModelEntries(defaultModelConfig).find((entry) => entry.id === 'defaulted-model');
+check('gateway model defaults fill omitted custom fields', defaultedEntry?.contextWindow === 65536 && defaultedEntry?.maxTokens === 4096 && JSON.stringify(defaultedEntry?.input) === JSON.stringify(['image']) && defaultedEntry?.source === 'gateway-default', JSON.stringify(defaultedEntry));
 
 // 3. Model entries + adapter resolve (single gateway = gateway at index 0)
 const gw0 = config.gateways[0];
@@ -129,7 +140,7 @@ const listedB = await adapter.listModels('gw-b');
 check('listModels gateway A: no gpt-4o (isolation)', listedA.length === 2 && !listedA.some((m) => m.id === 'gpt-4o'), JSON.stringify(listedA.map((m) => m.id)));
 check('listModels gateway B: gpt-4o only (isolation)', listedB.length === 1 && listedB[0].id === 'gpt-4o', JSON.stringify(listedB.map((m) => m.id)));
 const resolved = await adapter.resolveModel('air-outer', 'claude-opus-4-8');
-check('resolveModel claude', resolved.context?.contextWindow === 1000000 && resolved.defaultMaxTokens === 32768 && resolved.reasoning?.efforts?.length === 6, JSON.stringify(resolved.reasoning));
+check('resolveModel claude', resolved.context?.contextWindow === 1000000 && resolved.defaultMaxTokens === 4096 && resolved.reasoning?.efforts?.length === 6, JSON.stringify(resolved));
 try {
   await adapter.resolveModel('air-outer', 'not-enabled');
   check('resolveModel unknown throws', false);
@@ -162,17 +173,58 @@ const server = http.createServer((req, res) => {
   req.on('end', () => {
     requestCount += 1;
     lastBody = body;
-    lastSeenHeaders = { url: req.url, ua: req.headers['user-agent'], key: req.headers['x-api-key'] ?? req.headers['authorization']?.slice(0, 12), body: body.slice(0, 120) };
+    lastSeenHeaders = { url: req.url, ua: req.headers['user-agent'], key: req.headers['x-api-key'] ?? req.headers['authorization']?.slice(0, 12), body: body.slice(0, 120), full: req.headers };
     if (req.url.endsWith('/models')) {
+      if (req.headers['x-test-big']) {
+        // >4 MiB listing: discovery must refuse via its read cap (offline test
+        // for the body cap — never a real upstream).
+        const items = Array.from({ length: 220_000 }, (_, i) => ({ id: `model-${i}`, object: 'model' }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: items }));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ object: 'list', data: [
         { id: 'glm-5.3', object: 'model', context_window: 200000, max_output_tokens: 131072 },
         { id: 'glm-4.6', object: 'model' },
+        { id: 'glm-4.6', object: 'model' }, // duplicate id: discovery must dedupe (first wins)
         { id: '', object: 'model' },
       ] }));
       return;
     }
+    if (req.url.includes('/responses')) {
+      // OpenAI-responses SSE (auto/custom endpoint tests). Emits a text item;
+      // when the request carried tools, a function_call item streams too.
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      let parsedBody = {};
+      try { parsedBody = JSON.parse(body || '{}'); } catch { /* probe body */ }
+      const events = [
+        { type: 'response.created', response: { id: 'resp_1' } },
+        { type: 'response.output_item.added', output_index: 0, item: { type: 'message', role: 'assistant', id: 'msg_1' } },
+        { type: 'response.output_text.delta', item_id: 'msg_1', delta: 'hello from responses' },
+        { type: 'response.output_text.done', item_id: 'msg_1', text: 'hello from responses' },
+        { type: 'response.output_item.done', output_index: 0, item: { type: 'message', role: 'assistant', id: 'msg_1' } },
+      ];
+      if (Array.isArray(parsedBody.tools) && parsedBody.tools.length > 0) {
+        events.push(
+          { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_r1', name: String(parsedBody.tools[0]?.name ?? 'tool'), arguments: '' } },
+          { type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"q":"hub"}' },
+          { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_r1', name: String(parsedBody.tools[0]?.name ?? 'tool'), arguments: '{"q":"hub"}' } },
+        );
+      }
+      events.push({ type: 'response.completed', response: { id: 'resp_1', status: 'completed', usage: { input_tokens: 100, output_tokens: 20, input_tokens_details: { cached_tokens: 40 }, output_tokens_details: { reasoning_tokens: 5 } } } });
+      for (const ev of events) res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+      res.end();
+      return;
+    }
     if (req.url.includes('/chat/completions')) {
+      if (req.headers['x-test-echo-key']) {
+        // Echo the Authorization header back in an error body: the adapter
+        // must scrub the API key from the surfaced failure message.
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: `auth failed for ${req.headers['authorization']}` } }));
+        return;
+      }
       if (req.headers['x-test-tools']) {
         // Streaming tool-call variant
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -257,6 +309,7 @@ check('openai: usage chunk emitted before finish', oaiUsage !== undefined && oai
 check('openai: usage values (input 42, output 7)', oaiUsage?.inputTokens === 42 && oaiUsage?.outputTokens === 7, JSON.stringify(oaiUsage));
 check('openai: wire key bearer', 'Bearer sk-oai'.startsWith(lastSeenHeaders?.key ?? ''), JSON.stringify(lastSeenHeaders));
 check('openai: system prompt sent as system role', (lastSeenHeaders?.body ?? '').includes('"role":"system"') && (lastSeenHeaders?.body ?? '').includes('You are a helpful'), JSON.stringify(lastSeenHeaders?.body));
+check('openai: default streams request usage (stream_options.include_usage)', lastBody.includes('"stream_options":{"include_usage":true}'), lastBody.slice(0, 200));
 
 // 6b. systemRole: developer
 const oaiDevConfig = plugin.Config({ gateways: [{ ...config.gateways[0], api: 'openai-completions', systemRole: 'developer' }] }).gateways[0];
@@ -268,6 +321,18 @@ const oaiDevAdapter = new (Object.getPrototypeOf(adapter).constructor)({
 });
 for await (const _c of oaiDevAdapter.stream({ provider: 'air-outer', model: 'glm-5.3', maxTokens: 8, system: 'sys', messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
 check('openai: systemRole developer honored', (lastSeenHeaders?.body ?? '').includes('"role":"developer"'), JSON.stringify(lastSeenHeaders?.body));
+
+// 6b-2. streamUsage=false: strict gateways that reject stream_options must be
+// configurable — the body then carries no stream_options at all.
+const oaiNoUsageConfig = plugin.Config({ gateways: [{ ...config.gateways[0], api: 'openai-completions', streamUsage: false }] }).gateways[0];
+const oaiNoUsageAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [oaiNoUsageConfig] }),
+  gatewayFor: (p) => oaiNoUsageConfig.provider === p ? oaiNoUsageConfig : undefined,
+  resolveApiKey: async () => 'sk-oai',
+  preset: () => undefined,
+});
+for await (const _c of oaiNoUsageAdapter.stream({ provider: 'air-outer', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
+check('openai: streamUsage=false omits stream_options', !lastBody.includes('stream_options'), lastBody.slice(0, 200));
 
 // 6c. openai path: streaming tool_calls
 const oaiToolsConfig = plugin.Config({ gateways: [{ ...config.gateways[0], api: 'openai-completions', extraHeaders: { 'x-test-tools': '1' } }] }).gateways[0];
@@ -425,9 +490,15 @@ const fakeLlm = {
   listModels: async () => [{ provider: 'shuai-claude', id: 'claude-opus-4-8', name: 'Claude Opus 4.8' }],
   resolveModelInfo: async () => ({ provider: 'shuai-claude', id: 'claude-opus-4-8', name: 'Claude Opus 4.8', context: { contextWindow: 1000000 }, defaultMaxTokens: 32768 }),
 };
+const runtimeCredentialValues = new Map();
+const runtimeCredentials = {
+  async resolve(ref) { const value = runtimeCredentialValues.get(String(ref)); return value === undefined ? undefined : { value }; },
+  async describe(ref) { return { configured: runtimeCredentialValues.has(String(ref)) }; },
+  async set(ref, value) { runtimeCredentialValues.set(String(ref), value); },
+};
 const runtime = new ProviderHubRuntime(
   {
-    get: (n) => (n === 'settings' ? fakeSettings : n === 'llm' ? fakeLlm : undefined),
+    get: (n) => (n === 'settings' ? fakeSettings : n === 'llm' ? fakeLlm : n === 'credentials' ? runtimeCredentials : undefined),
     reflect: { provide: () => {} },
   },
   {
@@ -439,6 +510,11 @@ const runtime = new ProviderHubRuntime(
 );
 const st = await runtime.getState();
 check('runtime getState', st.ok === true && st.gateways.length === 1 && st.gateways[0].models.length === 3 && st.catalog['glm-5.3'] !== undefined, JSON.stringify({ ok: st.ok, gateways: st.gateways.length }));
+check('runtime getState redacts literal apiKey', st.gateways[0].gateway.apiKey === undefined && st.gateways[0].gateway.apiKeyConfigured === true && !JSON.stringify(st).includes('sk-test'), JSON.stringify(st.gateways[0].gateway));
+const newKeyWrite = await runtime.saveConfig(0, { apiKey: 'sk-runtime-new' });
+check('runtime saveConfig stores new apiKey in credentials only', newKeyWrite.ok === true && runtimeCredentialValues.get('GATEWAY_API_KEY') === 'sk-runtime-new' && stored.gateways[0].apiKey === '', JSON.stringify({ ok: newKeyWrite.ok, stored: stored.gateways[0].apiKey, hasCredential: runtimeCredentialValues.has('GATEWAY_API_KEY') }));
+const keptKey = await runtime.saveConfig(0, { apiKey: '' });
+check('runtime saveConfig empty apiKey preserves credential', keptKey.ok === true && runtimeCredentialValues.get('GATEWAY_API_KEY') === 'sk-runtime-new', JSON.stringify({ ok: keptKey.ok, key: runtimeCredentialValues.get('GATEWAY_API_KEY') }));
 const sc = await runtime.saveConfig(0, { displayName: 'Hub Test' });
 check('runtime saveConfig writes (index 0)', sc.ok === true && stored.gateways[0].displayName === 'Hub Test', JSON.stringify(stored.gateways[0].displayName));
 const tb = await runtime.toggleBuiltin(0, 'glm-5.3-flash', true);
@@ -477,6 +553,15 @@ const tcBadHeaders = await runtime.testConnection(0, { extraHeaders: { 'x-a': 1 
 check('runtime testConnection rejects non-string header value', tcBadHeaders.ok === false && /extraHeaders/.test(String(tcBadHeaders.error)), String(tcBadHeaders.error));
 const tcDead = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:1/' });
 check('runtime testConnection unreachable endpoint fails', tcDead.ok === false && /could not reach/.test(String(tcDead.error)), String(tcDead.error));
+// URL-embedded credentials must never surface in error messages.
+const tcCred = await runtime.testConnection(0, { baseURL: 'http://user:sekret@127.0.0.1:1/' });
+check('runtime testConnection: URL credentials redacted in errors', tcCred.ok === false && !String(tcCred.error).includes('sekret') && /\*\*\*/.test(String(tcCred.error)), String(tcCred.error));
+// A listing larger than the 4 MiB body cap must be refused (offline: the echo
+// server sends ~5 MiB when the x-test-big header is present).
+const tcBig = await runtime.testConnection(0, { extraHeaders: { 'x-test-big': '1' } });
+check('runtime testConnection: >4 MiB listing refused by read cap', tcBig.ok === false && /4 MiB/.test(String(tcBig.error)), String(tcBig.error));
+const tcBadHeaderInject = await runtime.testConnection(0, { extraHeaders: { 'x-a': 'v\nX-Inject: y' } });
+check('runtime testConnection rejects CRLF header value', tcBadHeaderInject.ok === false && /line breaks/.test(String(tcBadHeaderInject.error)), String(tcBadHeaderInject.error));
 const ro = await runtime.saveOverrides(0, { 'glm-5.3': { contextWindow: 999999 } });
 check('runtime saveOverrides', ro.ok === true && stored.gateways[0].modelOverrides['glm-5.3'].contextWindow === 999999);
 
@@ -560,32 +645,408 @@ check('rename: collision with another gateway refused', renameCollide.ok === fal
 const renameEmpty = await rebindRuntime.saveConfig(1, { provider: '  ' });
 check('rename: empty provider id refused', renameEmpty.ok === false && /must not be empty/.test(String(renameEmpty.error)), String(renameEmpty.error));
 
-// 7. Model discovery (echo /models) — draft request routed by baseURL
+// 9b-3. saveConfig wire-field validation: bad protocol values, URLs, and
+// header-injecting CR/LF values are refused at write time.
+const badApi = await rebindRuntime.saveConfig(1, { api: 'grpc' });
+check('saveConfig: unknown api protocol refused', badApi.ok === false && /api must be/.test(String(badApi.error)), String(badApi.error));
+const okApi = await rebindRuntime.saveConfig(1, { api: 'openai-completions' });
+check('saveConfig: valid api accepted', okApi.ok === true, String(okApi.error));
+const badSystemRole = await rebindRuntime.saveConfig(1, { systemRole: 'assistant' });
+check('saveConfig: unknown systemRole refused', badSystemRole.ok === false && /systemRole/.test(String(badSystemRole.error)), String(badSystemRole.error));
+const badBaseURL = await rebindRuntime.saveConfig(1, { baseURL: '://nope' });
+check('saveConfig: invalid baseURL refused', badBaseURL.ok === false && /valid URL/.test(String(badBaseURL.error)), String(badBaseURL.error));
+const badScheme = await rebindRuntime.saveConfig(1, { baseURL: 'ftp://gw.example.com' });
+check('saveConfig: non-http(s) baseURL refused', badScheme.ok === false && /http or https/.test(String(badScheme.error)), String(badScheme.error));
+const okBaseURL = await rebindRuntime.saveConfig(1, { baseURL: 'http://127.0.0.1:18996/v1' });
+check('saveConfig: valid baseURL accepted', okBaseURL.ok === true, String(okBaseURL.error));
+const badUA = await rebindRuntime.saveConfig(1, { userAgent: 'ua\r\nX-Inject: 1' });
+check('saveConfig: CRLF userAgent refused', badUA.ok === false && /line breaks/.test(String(badUA.error)), String(badUA.error));
+const badHeaderName = await rebindRuntime.saveConfig(1, { extraHeaders: { 'x-a\r\nX-Inject': 'v' } });
+check('saveConfig: CRLF header name refused', badHeaderName.ok === false && /line breaks/.test(String(badHeaderName.error)), String(badHeaderName.error));
+const okHeaders = await rebindRuntime.saveConfig(1, { extraHeaders: { 'x-fine': 'v' } });
+check('saveConfig: clean headers accepted', okHeaders.ok === true, String(okHeaders.error));
+const badStreamUsage = await rebindRuntime.saveConfig(1, { streamUsage: 'yes' });
+check('saveConfig: non-boolean streamUsage refused', badStreamUsage.ok === false && /streamUsage/.test(String(badStreamUsage.error)), String(badStreamUsage.error));
+
+// 9c. Model-edit phase 1: unified upsertModel/deleteModel RPCs (offline:
+// pure settings mutation through the fake settings service — no network).
+const gwSnap = () => JSON.stringify(stored.gateways[0]);
+
+// 9c-1. builtin add with params: ensures enabledModels + writes the override
+const upB = await runtime.upsertModel(0, { id: 'deepseek-v3', name: 'DS V3 Hub', contextWindow: 131072, reasoningEfforts: { off: null, low: 'low' } }, false, []);
+const ovB = stored.gateways[0].modelOverrides['deepseek-v3'];
+check('upsertModel builtin add: enables + writes override fields', upB.ok === true && upB.kind === 'builtin'
+  && stored.gateways[0].enabledModels.includes('deepseek-v3')
+  && ovB?.name === 'DS V3 Hub' && ovB?.contextWindow === 131072 && ovB?.reasoningEfforts?.low === 'low' && !('maxTokens' in (ovB ?? {})), JSON.stringify({ ok: upB.ok, ov: ovB }));
+check('upsertModel builtin add: envelope carries resolved models', upB.models?.some((m) => m.id === 'deepseek-v3' && m.name === 'DS V3 Hub' && m.reasoning?.low === 'low'), JSON.stringify(upB.models?.find((m) => m.id === 'deepseek-v3')));
+
+// 9c-2. overwrite=false refuses an already-configured builtin, config unchanged
+const snapB = gwSnap();
+const upB2 = await runtime.upsertModel(0, { id: 'deepseek-v3', maxTokens: 4096 }, false, []);
+check('upsertModel builtin overwrite=false refused', upB2.ok === false && /already has saved overrides/.test(String(upB2.error)), String(upB2.error));
+check('upsertModel builtin refusal left config unchanged', gwSnap() === snapB);
+
+// 9c-3. override merge + clearFields: fields merge, cleared field falls back to catalog
+const upB3 = await runtime.upsertModel(0, { id: 'deepseek-v3', name: 'DS V3 Renamed', maxTokens: 4096 }, true, ['contextWindow']);
+const ovB3 = stored.gateways[0].modelOverrides['deepseek-v3'];
+check('upsertModel merge: fields merged, clearFields removed contextWindow', upB3.ok === true
+  && ovB3?.name === 'DS V3 Renamed' && ovB3?.maxTokens === 4096 && ovB3?.reasoningEfforts?.low === 'low' && !('contextWindow' in (ovB3 ?? {})), JSON.stringify(ovB3));
+const resolvedB3 = upB3.models?.find((m) => m.id === 'deepseek-v3');
+check('upsertModel merge: cleared field falls back to catalog values', resolvedB3?.contextWindow === 128000 && resolvedB3?.maxTokens === 4096 && resolvedB3?.name === 'DS V3 Renamed', JSON.stringify(resolvedB3));
+
+// 9c-4. custom add: capacities required (no silent 128000/8192), input filtered + deduped
+const upC = await runtime.upsertModel(0, { id: 'hub-custom-1', name: 'Hub Custom', contextWindow: 32000, maxTokens: 2048, input: ['text', 'image', 'audio', 'text'] }, false, []);
+check('upsertModel custom add: stored with positive capacities + filtered input', upC.ok === true && upC.kind === 'custom'
+  && stored.gateways[0].customModels.some((m) => m.id === 'hub-custom-1' && m.contextWindow === 32000 && m.maxTokens === 2048 && JSON.stringify(m.input) === JSON.stringify(['text', 'image'])), JSON.stringify(stored.gateways[0].customModels));
+
+const snapC = gwSnap();
+const upC2 = await runtime.upsertModel(0, { id: 'hub-custom-2', name: 'No Caps' }, false, []);
+check('upsertModel custom add without capacities refused (no silent fallback)', upC2.ok === false && /positive integer contextWindow/.test(String(upC2.error)), String(upC2.error));
+const upC3 = await runtime.upsertModel(0, { id: 'hub-custom-2', contextWindow: 0, maxTokens: 2048 }, false, []);
+check('upsertModel custom add with non-positive contextWindow refused', upC3.ok === false, String(upC3.error));
+const upC4 = await runtime.upsertModel(0, { id: 'hub-custom-2', contextWindow: 32000.5, maxTokens: 2048 }, false, []);
+check('upsertModel custom add with non-integer contextWindow refused', upC4.ok === false, String(upC4.error));
+check('upsertModel custom refusals left config unchanged', gwSnap() === snapC);
+
+// 9c-5. custom edit (overwrite=true): unedited fields kept, wire values trimmed
+const upC5 = await runtime.upsertModel(0, { id: 'hub-custom-1', contextWindow: 48000, reasoningEfforts: { off: null, high: ' HIGH ' } }, true, []);
+const edited = stored.gateways[0].customModels.find((m) => m.id === 'hub-custom-1');
+check('upsertModel custom edit: kept fields + trimmed wire value', upC5.ok === true
+  && edited?.name === 'Hub Custom' && edited?.contextWindow === 48000 && edited?.maxTokens === 2048
+  && edited?.reasoningEfforts?.high === 'HIGH' && edited?.reasoningEfforts?.off === null, JSON.stringify(edited));
+
+// 9c-6. reasoningEfforts=false on a custom entry clears the map (non-reasoning)
+const upC6 = await runtime.upsertModel(0, { id: 'hub-custom-1', reasoningEfforts: false }, true, []);
+const nonReasoning = stored.gateways[0].customModels.find((m) => m.id === 'hub-custom-1');
+check('upsertModel custom: reasoningEfforts=false clears the map', upC6.ok === true && nonReasoning?.reasoningEfforts === undefined, JSON.stringify(nonReasoning));
+
+// 9c-7. rename: editing with a changed id forms a NEW custom, old entry removed
+const upR = await runtime.upsertModel(0, { id: 'hub-custom-2', name: 'Renamed Model', originalId: 'hub-custom-1' }, false, []);
+check('upsertModel rename: old id removed, new id present with kept params', upR.ok === true && upR.kind === 'custom'
+  && !stored.gateways[0].customModels.some((m) => m.id === 'hub-custom-1')
+  && stored.gateways[0].customModels.some((m) => m.id === 'hub-custom-2' && m.name === 'Renamed Model' && m.contextWindow === 48000 && m.maxTokens === 2048), JSON.stringify(stored.gateways[0].customModels));
+
+// 9c-8. overwrite=false refuses an existing custom id
+const upD = await runtime.upsertModel(0, { id: 'hub-custom-2', name: 'Dup', contextWindow: 32000, maxTokens: 2048 }, false, []);
+check('upsertModel custom overwrite=false refused', upD.ok === false && /already exists/.test(String(upD.error)), String(upD.error));
+
+// 9c-9. builtin/custom same-id conflict (the legacy upsertCustom RPC can create the shadow)
+const mkShadow = await runtime.upsertCustom(0, { id: 'glm-5.3', name: 'Shadow GLM', contextWindow: 200000, maxTokens: 131072 }, null);
+check('setup: legacy upsertCustom created a same-id shadow (old RPC unchanged)', mkShadow.ok === true && stored.gateways[0].customModels.some((m) => m.id === 'glm-5.3'));
+const snapX = gwSnap();
+const upX = await runtime.upsertModel(0, { id: 'glm-5.3', maxTokens: 1 }, true, []);
+check('upsertModel conflict: builtin id shadowed by custom entry refused', upX.ok === false && /custom model with the same id/.test(String(upX.error)), String(upX.error));
+const upX2 = await runtime.upsertModel(0, { id: 'glm-5.3-flash', originalId: 'hub-custom-2', name: 'Nope' }, true, []);
+check('upsertModel conflict: renaming a custom onto a built-in id refused', upX2.ok === false && /onto built-in id/.test(String(upX2.error)), String(upX2.error));
+check('upsertModel conflict refusals left config unchanged', gwSnap() === snapX);
+const cleanupShadow = await runtime.deleteCustom(0, 'glm-5.3');
+check('cleanup: shadow removed via legacy deleteCustom', cleanupShadow.ok === true);
+
+// 9c-10. delete builtin removes enabledModels AND the override together
+const upK = await runtime.upsertModel(0, { id: 'kimi-k2', name: 'Kimi Hub', contextWindow: 131072, maxTokens: 16384, reasoningEfforts: { off: null, max: 'max' } }, false, []);
+check('setup: kimi-k2 builtin configured via upsertModel', upK.ok === true && stored.gateways[0].enabledModels.includes('kimi-k2') && stored.gateways[0].modelOverrides['kimi-k2']?.maxTokens === 16384, String(upK.error));
+const delB = await runtime.deleteModel(0, 'kimi-k2');
+check('deleteModel builtin: removes enabledModels + override together', delB.ok === true && delB.kind === 'builtin'
+  && !stored.gateways[0].enabledModels.includes('kimi-k2') && stored.gateways[0].modelOverrides['kimi-k2'] === undefined, JSON.stringify({ ok: delB.ok, err: delB.error }));
+
+// 9c-11. delete custom removes the entry; unknown/unconfigured ids refused
+const delC = await runtime.deleteModel(0, 'hub-custom-2');
+check('deleteModel custom: removes the entry', delC.ok === true && delC.kind === 'custom' && !stored.gateways[0].customModels.some((m) => m.id === 'hub-custom-2'), String(delC.error));
+const delGhost = await runtime.deleteModel(0, 'hub-custom-2');
+check('deleteModel unknown id refused', delGhost.ok === false && /does not exist/.test(String(delGhost.error)), String(delGhost.error));
+const delUnset = await runtime.deleteModel(0, 'kimi-k2');
+check('deleteModel unconfigured builtin refused', delUnset.ok === false && /not configured/.test(String(delUnset.error)), String(delUnset.error));
+
+// 9c-12. invalid reasoning maps refused at validation; config untouched
+const snapReason = gwSnap();
+const upBad1 = await runtime.upsertModel(0, { id: 'gpt-4o-mini', reasoningEfforts: { off: null, low: null } }, false, []);
+check('upsertModel: non-off null wire value refused', upBad1.ok === false && /needs the wire value/.test(String(upBad1.error)), String(upBad1.error));
+const upBad2 = await runtime.upsertModel(0, { id: 'gpt-4o-mini', reasoningEfforts: { off: null } }, false, []);
+check('upsertModel: off-only map refused', upBad2.ok === false && /non-off level/.test(String(upBad2.error)), String(upBad2.error));
+const upBad3 = await runtime.upsertModel(0, { id: 'gpt-4o-mini', reasoningEfforts: { off: null, turbo: 'turbo' } }, false, []);
+check('upsertModel: unknown level refused', upBad3.ok === false && /unknown reasoning level/.test(String(upBad3.error)), String(upBad3.error));
+const upBad4 = await runtime.upsertModel(0, { id: 'gpt-4o-mini', reasoningEfforts: { off: null, high: '' } }, false, []);
+check('upsertModel: empty wire value refused', upBad4.ok === false && /non-empty string/.test(String(upBad4.error)), String(upBad4.error));
+const upBad5 = await runtime.upsertModel(0, { id: 'gpt-4o-mini', reasoningEfforts: false }, false, []);
+check('upsertModel builtin: reasoningEfforts=false refused (catalog reasoning only clearable via override)', upBad5.ok === false && /cannot declare reasoningEfforts: false/.test(String(upBad5.error)), String(upBad5.error));
+check('upsertModel: refused writes left config unchanged', gwSnap() === snapReason);
+
+// 9c-13. saveOverrides pre-write resolve check: a map the read side would refuse never lands
+const roBad = await runtime.saveOverrides(0, { 'glm-5.3': { reasoningEfforts: { off: null } } });
+check('saveOverrides: off-only map refused before write', roBad.ok === false && /refusing to save/.test(String(roBad.error)) && /no level beyond "off"/.test(String(roBad.error)), String(roBad.error));
+check('saveOverrides refusal left config unchanged', gwSnap() === snapReason);
+
+// 9c-14. legacy-compat delete: an id unknown to the catalog but present in
+// enabledModels (hand-edited settings / retired catalog entry) is cleaned up
+// instead of wedging the unified delete; the read side keeps skipping it.
+const toggleUnknown = await runtime.toggleBuiltin(0, 'retired-legacy-model', true);
+check('setup: unknown id enabled via legacy toggleBuiltin (read-side compat kept)', toggleUnknown.ok === true && stored.gateways[0].enabledModels.includes('retired-legacy-model'));
+const delOrphan = await runtime.deleteModel(0, 'retired-legacy-model');
+check('deleteModel legacy unknown id: cleaned from enabledModels (orphan path)', delOrphan.ok === true && delOrphan.kind === 'orphan' && !stored.gateways[0].enabledModels.includes('retired-legacy-model'), String(delOrphan.error));
+
+// 7. Model discovery (echo /models) — draft request routed by baseURL.
+// The echo listing holds 3 non-empty ids with one duplicate: the count of 2
+// proves id dedupe (first occurrence wins).
 const discovered = await registered.discovery.fn({ baseURL: 'http://127.0.0.1:18996', apiKey: 'sk-test' });
-check('discovery: 2 models', discovered.length === 2, JSON.stringify(discovered));
+check('discovery: duplicate ids deduped (2 of 3 kept)', discovered.length === 2 && discovered[0].id === 'glm-5.3' && discovered[1].id === 'glm-4.6', JSON.stringify(discovered));
 check('discovery: params mapped', discovered[0].contextWindow === 200000 && discovered[0].maxTokens === 131072, JSON.stringify(discovered[0]));
 
-// 8. Live probe (fake key) through the adapter
-const liveConfig = plugin.Config({ gateways: [{
+// 8. Offline wire probe through the adapter (the historical live probe against
+// an external gateway was retired — tests must not touch the network). The
+// regression intent is kept: the custom UA and the credential must actually
+// reach the wire (UA-gate semantics), and the stream must complete.
+const offlineConfig = plugin.Config({ gateways: [{
   provider: 'air-outer',
-  baseURL: 'https://ps.air-outer.com',
+  baseURL: 'http://127.0.0.1:18996',
   api: 'anthropic-messages',
   userAgent: 'claude-cli/2.0.1 (external, cli)',
   apiKey: 'sk-aQ3po5zL-FAKE-KEY',
   enabledModels: ['glm-5.3'],
 }] }).gateways[0];
-const liveAdapter = new (Object.getPrototypeOf(adapter).constructor)({
-  current: () => ({ gateways: [liveConfig] }),
-  gatewayFor: (p) => liveConfig.provider === p ? liveConfig : undefined,
+const offlineAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [offlineConfig] }),
+  gatewayFor: (p) => offlineConfig.provider === p ? offlineConfig : undefined,
   resolveApiKey: async () => 'sk-aQ3po5zL-FAKE-KEY',
   preset: () => undefined,
 });
-const liveStream = liveAdapter.stream({ provider: 'air-outer', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] });
-const liveChunks = [];
-for await (const c of liveStream) liveChunks.push(c);
-const liveFinish = liveChunks.find((c) => c.type === 'finish');
-console.log('[live] finish:', JSON.stringify(liveFinish?.reason ?? null).slice(0, 250));
-check('live: UA gate passed (invalid token, not unauthorized client)', liveFinish?.reason?.kind === 'error' && !/unauthorized client/.test(liveFinish?.reason?.failure?.message ?? ''), liveFinish?.reason?.failure?.message?.slice(0, 150));
+const offlineStream = offlineAdapter.stream({ provider: 'air-outer', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] });
+const offlineChunks = [];
+for await (const c of offlineStream) offlineChunks.push(c);
+const offlineFinish = offlineChunks.find((c) => c.type === 'finish');
+check('offline probe: custom UA + key reach the wire', lastSeenHeaders?.ua === 'claude-cli/2.0.1 (external, cli)' && lastSeenHeaders?.key === 'sk-aQ3po5zL-FAKE-KEY', JSON.stringify(lastSeenHeaders));
+check('offline probe: stream completes (finish stop)', offlineFinish?.reason?.kind === 'stop', JSON.stringify(offlineFinish?.reason ?? null));
+
+// 8b. An upstream error body echoing the API key (misconfigured gateways do
+// bounce the Authorization header back) must come back scrubbed.
+const echoConfig = plugin.Config({ gateways: [{
+  provider: 'echo-key',
+  baseURL: 'http://127.0.0.1:18996',
+  api: 'openai-completions',
+  userAgent: 'ua-echo',
+  apiKey: 'sk-ECHO-SECRET-123',
+  extraHeaders: { 'x-test-echo-key': '1' },
+  enabledModels: ['glm-5.3'],
+}] }).gateways[0];
+const echoAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [echoConfig] }),
+  gatewayFor: (p) => echoConfig.provider === p ? echoConfig : undefined,
+  resolveApiKey: async () => 'sk-ECHO-SECRET-123',
+  preset: () => undefined,
+});
+const echoChunks = [];
+for await (const c of echoAdapter.stream({ provider: 'echo-key', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) echoChunks.push(c);
+const echoFailure = echoChunks.at(-1)?.reason?.failure;
+check('upstream error echoes are scrubbed of the API key', echoFailure?.code === 'UPSTREAM_ERROR'
+  && String(echoFailure?.message ?? '').includes('upstream 401')
+  && !String(echoFailure?.message ?? '').includes('sk-ECHO-SECRET-123'), JSON.stringify(echoFailure ?? null));
+
+// 10. Three-protocol + endpoint-mode coverage (offline echo server only).
+// 10a. openai-responses path: auto mode (bare host) dials /v1/responses with a
+// Responses-shaped body and Bearer auth; the stream converts text + tool call
+// + usage + finish.
+const respConfig = plugin.Config({ gateways: [{
+  provider: 'resp-gw',
+  baseURL: 'http://127.0.0.1:18996',
+  api: 'openai-responses',
+  userAgent: 'ua-resp',
+  apiKey: 'sk-resp',
+  enabledModels: ['glm-5.3'],
+}] }).gateways[0];
+check('schema defaults: endpointMode auto + endpoint empty (old configs stay auto)', respConfig.endpointMode === 'auto' && respConfig.endpoint === '', JSON.stringify({ mode: respConfig.endpointMode, endpoint: respConfig.endpoint }));
+const respAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [respConfig] }),
+  gatewayFor: (p) => respConfig.provider === p ? respConfig : undefined,
+  resolveApiKey: async () => 'sk-resp',
+});
+const respChunks = [];
+for await (const c of respAdapter.stream({
+  provider: 'resp-gw',
+  model: 'glm-5.3',
+  maxTokens: 64,
+  reasoningEffort: 'high',
+  system: 'You are terse.',
+  tools: [{ name: 'web_search', description: 'search', parameters: { type: 'object', properties: { q: { type: 'string' } } } }],
+  messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+})) respChunks.push(c);
+check('responses e2e: text delta converted', respChunks.some((c) => c.type === 'text-delta' && c.text === 'hello from responses'), JSON.stringify(respChunks.map((c) => c.type)));
+check('responses e2e: tool-call block closed with name + args', respChunks.some((c) => c.type === 'block-end' && c.block?.type === 'tool-call' && c.block?.name === 'web_search' && c.block?.arguments === '{"q":"hub"}'), JSON.stringify(respChunks));
+const respUsage = respChunks.find((c) => c.type === 'usage')?.usage;
+check('responses e2e: usage mapped (input split cached, reasoning carried)', respUsage?.inputTokens === 60 && respUsage?.cacheReadTokens === 40 && respUsage?.outputTokens === 20 && respUsage?.reasoningTokens === 5, JSON.stringify(respUsage));
+check('responses e2e: finish tool-calls (function call streamed)', respChunks.at(-1)?.reason?.kind === 'tool-calls', JSON.stringify(respChunks.at(-1)));
+check('responses e2e: wire URL /v1/responses (auto, bare host)', lastSeenHeaders?.url === '/v1/responses', String(lastSeenHeaders?.url));
+check('responses e2e: wire UA + Bearer auth', lastSeenHeaders?.full?.['user-agent'] === 'ua-resp' && lastSeenHeaders?.full?.authorization === 'Bearer sk-resp', JSON.stringify(lastSeenHeaders?.full));
+check('responses e2e: body uses model/input/instructions/tools/stream', ['"model":"glm-5.3"', '"input"', '"instructions":"You are terse."', '"tools":[{"type":"function","name":"web_search"', '"stream":true'].every((s) => lastBody.includes(s)), lastBody.slice(0, 400));
+check('responses e2e: max_output_tokens (not Chat max_tokens)', lastBody.includes('"max_output_tokens":64') && !lastBody.includes('"max_tokens"'), lastBody.slice(0, 200));
+check('responses e2e: effort in reasoning.effort (existing mapping)', lastBody.includes('"reasoning":{"effort":"high"}'), lastBody.slice(0, 200));
+check('responses e2e: no Chat-only stream_options on the Responses wire', !lastBody.includes('stream_options'), lastBody.slice(0, 200));
+
+// 10b. responses + systemRole developer: instruction rides as a developer
+// input item instead of the top-level instructions parameter.
+const respDevConfig = plugin.Config({ gateways: [{ ...respConfig, systemRole: 'developer' }] }).gateways[0];
+const respDevAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [respDevConfig] }),
+  gatewayFor: (p) => respDevConfig.provider === p ? respDevConfig : undefined,
+  resolveApiKey: async () => 'sk-resp',
+});
+for await (const _c of respDevAdapter.stream({ provider: 'resp-gw', model: 'glm-5.3', maxTokens: 8, system: 'sys text', messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
+check('responses e2e: systemRole developer -> developer input item, no instructions param', lastBody.includes('"role":"developer"') && lastBody.includes('sys text') && !lastBody.includes('"instructions"'), lastBody.slice(0, 300));
+
+// 10c. custom endpoint mode: the chat request dials the COMPLETE endpoint URL
+// verbatim (no path appended, no /v1 inserted) and an empty baseURL is legal.
+const customConfig = plugin.Config({ gateways: [{
+  provider: 'custom-gw',
+  baseURL: '',
+  endpointMode: 'custom',
+  endpoint: 'http://127.0.0.1:18996/custom/v1/chat/completions',
+  api: 'openai-completions',
+  userAgent: 'ua-custom',
+  apiKey: 'sk-custom',
+  enabledModels: ['glm-5.3'],
+}] }).gateways[0];
+const customAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [customConfig] }),
+  gatewayFor: (p) => customConfig.provider === p ? customConfig : undefined,
+  resolveApiKey: async () => 'sk-custom',
+});
+const customChunks = [];
+for await (const c of customAdapter.stream({ provider: 'custom-gw', model: 'glm-5.3', maxTokens: 16, messages: [{ role: 'user', content: 'hi' }] })) customChunks.push(c);
+check('custom mode chat: complete endpoint dialed verbatim (/custom/v1/... kept, no /v1 insert)', lastSeenHeaders?.url === '/custom/v1/chat/completions', String(lastSeenHeaders?.url));
+check('custom mode chat: stream works with empty baseURL', customChunks.some((c) => c.type === 'text-delta') && customChunks.at(-1)?.reason?.kind === 'stop', JSON.stringify(customChunks.map((c) => c.type)));
+
+// 10d. custom mode responses endpoint: same verbatim rule for /responses.
+const customRespConfig = plugin.Config({ gateways: [{ ...customConfig, endpoint: 'http://127.0.0.1:18996/my-responses', api: 'openai-responses' }] }).gateways[0];
+const customRespAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [customRespConfig] }),
+  gatewayFor: (p) => customRespConfig.provider === p ? customRespConfig : undefined,
+  resolveApiKey: async () => 'sk-custom',
+});
+for await (const _c of customRespAdapter.stream({ provider: 'custom-gw', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
+check('custom mode responses: complete endpoint dialed verbatim', lastSeenHeaders?.url === '/my-responses', String(lastSeenHeaders?.url));
+
+// 10e. custom mode anthropic messages endpoint + auth headers.
+const customAnthropicConfig = plugin.Config({ gateways: [{ ...customConfig, endpoint: 'http://127.0.0.1:18996/my-messages', api: 'anthropic-messages' }] }).gateways[0];
+const customAnthropicAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [customAnthropicConfig] }),
+  gatewayFor: (p) => customAnthropicConfig.provider === p ? customAnthropicConfig : undefined,
+  resolveApiKey: async () => 'sk-anthropic',
+});
+const customAnthropicChunks = [];
+for await (const c of customAnthropicAdapter.stream({ provider: 'custom-gw', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) customAnthropicChunks.push(c);
+check('custom mode anthropic: complete endpoint dialed verbatim', lastSeenHeaders?.url === '/my-messages', String(lastSeenHeaders?.url));
+check('custom mode anthropic: x-api-key + anthropic-version on the wire (no Bearer)', lastSeenHeaders?.full?.['x-api-key'] === 'sk-anthropic' && lastSeenHeaders?.full?.['anthropic-version'] === '2023-06-01' && lastSeenHeaders?.full?.authorization === undefined, JSON.stringify(lastSeenHeaders?.full));
+check('custom mode anthropic: stream completes', customAnthropicChunks.at(-1)?.reason?.kind === 'stop', JSON.stringify(customAnthropicChunks.at(-1)));
+
+// 10f. custom mode chat without endpoint refused BEFORE network I/O.
+// Counting order (same bracket discipline as 6e/6f): the requestCount snapshot
+// is taken immediately BEFORE the drain — after all (synchronous) setup — so
+// the bracket covers only the operation under test and any increment inside
+// it means the refusal leaked network I/O. The strict equality and the
+// refusal-message match must both stay intact.
+const noEndpointConfig = plugin.Config({ gateways: [{ ...customConfig, endpoint: '  ' }] }).gateways[0];
+const noEndpointAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [noEndpointConfig] }),
+  gatewayFor: (p) => noEndpointConfig.provider === p ? noEndpointConfig : undefined,
+  resolveApiKey: async () => 'sk-custom',
+});
+const beforeCustom = requestCount;
+const noEndpointDrain = [];
+for await (const c of noEndpointAdapter.stream({ provider: 'custom-gw', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) noEndpointDrain.push(c);
+check('custom mode: empty endpoint refused before any request', noEndpointDrain.at(-1)?.reason?.kind === 'error'
+  && /endpoint \(the complete request URL\)/.test(noEndpointDrain.at(-1)?.reason?.failure?.message ?? '')
+  && requestCount === beforeCustom, JSON.stringify(noEndpointDrain.at(-1)?.reason));
+
+// 10g. discovery: per-protocol auth + custom-mode models URL + critical-header
+// protection (extraHeaders must not override auth/protocol/UA).
+const { discoverModels } = await import('../src/discovery.ts');
+const discBase = { baseURL: 'http://127.0.0.1:18996', userAgent: 'ua-disc', apiKeyEnv: 'GATEWAY_API_KEY', enabledModels: [], modelOverrides: {}, customModels: [] };
+const anthropicDiscGw = { ...discBase, api: 'anthropic-messages', endpointMode: 'auto', extraHeaders: { authorization: 'Bearer fake', 'x-api-key': 'fake', 'anthropic-version': '9999', 'user-agent': 'override-attempt', 'HOST': 'evil.example.com', 'Content-Length': '1' } };
+const anthropicDisc = await discoverModels({ baseURL: 'http://127.0.0.1:18996', apiKey: 'sk-disc' }, anthropicDiscGw, async () => 'sk-disc');
+check('discovery anthropic: x-api-key + anthropic-version used (draft key wins), never Bearer', lastSeenHeaders?.full?.['x-api-key'] === 'sk-disc'
+  && lastSeenHeaders?.full?.['anthropic-version'] === '2023-06-01'
+  && lastSeenHeaders?.full?.authorization === undefined, JSON.stringify(lastSeenHeaders?.full));
+check('discovery anthropic: extraHeaders cannot override auth/protocol/UA headers', lastSeenHeaders?.full?.['user-agent'] === 'ua-disc', JSON.stringify(lastSeenHeaders?.full));
+check('discovery anthropic: transport headers cannot override routing/framing (case-insensitive)', lastSeenHeaders?.full?.host === '127.0.0.1:18996' && lastSeenHeaders?.full?.['content-length'] !== '1', JSON.stringify({ host: lastSeenHeaders?.full?.host, cl: lastSeenHeaders?.full?.['content-length'] }));
+check('discovery anthropic: listing parsed', anthropicDisc.length === 2, JSON.stringify(anthropicDisc));
+const responsesDiscGw = { ...discBase, api: 'openai-responses', endpointMode: 'auto', extraHeaders: { authorization: 'Bearer fake', 'x-api-key': 'fake' } };
+await discoverModels({ baseURL: 'http://127.0.0.1:18996', apiKey: 'sk-disc' }, responsesDiscGw, async () => 'sk-disc');
+check('discovery openai-responses: Bearer used, x-api-key not overridable', lastSeenHeaders?.full?.authorization === 'Bearer sk-disc' && lastSeenHeaders?.full?.['x-api-key'] === undefined, JSON.stringify(lastSeenHeaders?.full));
+const customDiscGw = { ...discBase, api: 'openai-completions', endpointMode: 'custom', extraHeaders: {} };
+await discoverModels({ baseURL: 'http://127.0.0.1:18996/api/models', apiKey: 'sk-disc' }, customDiscGw, async () => 'sk-disc');
+check('discovery custom mode: baseURL IS the complete models URL (no join)', lastSeenHeaders?.url === '/api/models', String(lastSeenHeaders?.url));
+const tcCustomModels = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996/api/models', endpointMode: 'custom', apiKey: 'sk-draft' });
+check('runtime testConnection custom mode: envelope reports the verbatim models URL', tcCustomModels.ok === true && tcCustomModels.endpoint === 'http://127.0.0.1:18996/api/models', JSON.stringify({ ok: tcCustomModels.ok, endpoint: tcCustomModels.endpoint, error: tcCustomModels.error }));
+const tcBadEndpointMode = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996', endpointMode: 'nonsense' });
+check('runtime testConnection: unknown endpointMode draft falls back to saved (auto)', tcBadEndpointMode.ok === true && tcBadEndpointMode.endpoint === 'http://127.0.0.1:18996/v1/models', JSON.stringify({ ok: tcBadEndpointMode.ok, endpoint: tcBadEndpointMode.endpoint, error: tcBadEndpointMode.error }));
+
+// 10g-2. adapter: sanitizeExtraHeaders on the wire — credential/protocol/
+// transport headers cannot ride through extraHeaders on either protocol
+// (case-insensitive name matching), while non-reserved custom headers pass.
+const smuggleConfig = plugin.Config({ gateways: [{
+  provider: 'smuggle-gw',
+  baseURL: 'http://127.0.0.1:18996',
+  api: 'openai-completions',
+  userAgent: 'ua-sanitize',
+  apiKey: 'sk-sanitize',
+  extraHeaders: {
+    'X-API-KEY': 'smuggled',       // cross-protocol credential, mixed case
+    'anthropic-version': '9999',   // protocol pin for the wrong protocol
+    'Content-Type': 'text/plain',  // body framing
+    'CONTENT-LENGTH': '9999',      // transport framing
+    'Host': 'evil.example.com',    // routing
+    'User-Agent': 'smuggled-ua',   // UA override
+    'x-keep-me': 'kept',           // non-reserved: must survive sanitization
+  },
+  enabledModels: ['glm-5.3'],
+}] }).gateways[0];
+const smuggleAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [smuggleConfig] }),
+  gatewayFor: (p) => smuggleConfig.provider === p ? smuggleConfig : undefined,
+  resolveApiKey: async () => 'sk-sanitize',
+});
+const smuggleChunks = [];
+for await (const c of smuggleAdapter.stream({ provider: 'smuggle-gw', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) smuggleChunks.push(c);
+check('sanitize openai: only Bearer auth rides the wire (x-api-key/anthropic-version dropped case-insensitively)', lastSeenHeaders?.full?.authorization === 'Bearer sk-sanitize'
+  && lastSeenHeaders?.full?.['x-api-key'] === undefined && lastSeenHeaders?.full?.['anthropic-version'] === undefined, JSON.stringify(lastSeenHeaders?.full));
+check('sanitize openai: transport headers cannot override (host/content-length/content-type)', lastSeenHeaders?.full?.host === '127.0.0.1:18996'
+  && lastSeenHeaders?.full?.['content-length'] !== '9999' && lastSeenHeaders?.full?.['content-type'] === 'application/json', JSON.stringify({ host: lastSeenHeaders?.full?.host, cl: lastSeenHeaders?.full?.['content-length'], ct: lastSeenHeaders?.full?.['content-type'] }));
+check('sanitize openai: configured UA wins, non-reserved custom header kept', lastSeenHeaders?.full?.['user-agent'] === 'ua-sanitize' && lastSeenHeaders?.full?.['x-keep-me'] === 'kept', JSON.stringify({ ua: lastSeenHeaders?.full?.['user-agent'], keep: lastSeenHeaders?.full?.['x-keep-me'] }));
+check('sanitize openai: stream still completes', smuggleChunks.at(-1)?.reason?.kind === 'stop', JSON.stringify(smuggleChunks.at(-1)));
+
+// Anthropic side: uppercase AUTHORIZATION + a wrong x-api-key must never
+// displace the protocol-correct x-api-key + anthropic-version pair.
+const smuggleAnthropicConfig = plugin.Config({ gateways: [{
+  provider: 'smuggle-anthropic',
+  baseURL: 'http://127.0.0.1:18996',
+  api: 'anthropic-messages',
+  userAgent: 'ua-sanitize',
+  apiKey: 'sk-anthro',
+  extraHeaders: { 'AUTHORIZATION': 'Bearer smuggled', 'x-api-key': 'wrong-key', 'user-agent': 'smuggled-ua' },
+  enabledModels: ['glm-5.3'],
+}] }).gateways[0];
+const smuggleAnthropicAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [smuggleAnthropicConfig] }),
+  gatewayFor: (p) => smuggleAnthropicConfig.provider === p ? smuggleAnthropicConfig : undefined,
+  resolveApiKey: async () => 'sk-anthro',
+});
+const smuggleAnthropicChunks = [];
+for await (const c of smuggleAnthropicAdapter.stream({ provider: 'smuggle-anthropic', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) smuggleAnthropicChunks.push(c);
+check('sanitize anthropic: x-api-key + anthropic-version only (uppercase AUTHORIZATION dropped, wrong key displaced)', lastSeenHeaders?.full?.['x-api-key'] === 'sk-anthro'
+  && lastSeenHeaders?.full?.authorization === undefined && lastSeenHeaders?.full?.['anthropic-version'] === '2023-06-01', JSON.stringify(lastSeenHeaders?.full));
+check('sanitize anthropic: configured UA wins + stream completes', lastSeenHeaders?.full?.['user-agent'] === 'ua-sanitize' && smuggleAnthropicChunks.at(-1)?.reason?.kind === 'stop', JSON.stringify(smuggleAnthropicChunks.at(-1)));
+
+// 10h. saveConfig validation for the new fields.
+const badEndpointMode = await rebindRuntime.saveConfig(1, { endpointMode: 'fastest' });
+check('saveConfig: unknown endpointMode refused', badEndpointMode.ok === false && /endpointMode must be/.test(String(badEndpointMode.error)), String(badEndpointMode.error));
+const okEndpointMode = await rebindRuntime.saveConfig(1, { endpointMode: 'custom' });
+check('saveConfig: valid endpointMode accepted', okEndpointMode.ok === true, String(okEndpointMode.error));
+const badEndpointScheme = await rebindRuntime.saveConfig(1, { endpoint: 'javascript:alert(1)' });
+check('saveConfig: non-http(s) endpoint refused', badEndpointScheme.ok === false && /endpoint/.test(String(badEndpointScheme.error)) && /http or https/.test(String(badEndpointScheme.error)), String(badEndpointScheme.error));
+const badEndpointCRLF = await rebindRuntime.saveConfig(1, { endpoint: 'http://gw.example.com/x\r\nX-Inject: 1' });
+check('saveConfig: CRLF endpoint refused', badEndpointCRLF.ok === false && /line breaks/.test(String(badEndpointCRLF.error)), String(badEndpointCRLF.error));
+const badEndpointUrl = await rebindRuntime.saveConfig(1, { endpoint: '://nope' });
+check('saveConfig: invalid endpoint URL refused', badEndpointUrl.ok === false && /endpoint is not a valid URL/.test(String(badEndpointUrl.error)), String(badEndpointUrl.error));
+const okEndpoint = await rebindRuntime.saveConfig(1, { endpoint: 'http://127.0.0.1:18996/custom/v1/chat/completions', api: 'openai-completions' });
+check('saveConfig: complete custom endpoint accepted', okEndpoint.ok === true, String(okEndpoint.error));
 
 server.close();
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

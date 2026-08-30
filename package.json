@@ -1,7 +1,7 @@
 {
   "name": "@tappat225/dsh-provider-hub",
   "version": "0.5.0",
-  "description": "DSH LLM provider hub: register gateway routes with their own settings panel, a built-in mainstream model catalog, custom User-Agent for UA-whitelisted gateways, field-level model overrides, and live model discovery. Configure in the plugin panel — no hand-editing settings.yaml.",
+  "description": "DSH LLM provider hub: register gateway routes with their own settings panel, three wire protocols (anthropic-messages, openai-completions, openai-responses), auto/custom endpoint addressing, custom User-Agent for UA-whitelisted gateways, field-level model overrides, and live model discovery. Configure in the plugin panel — no hand-editing settings.yaml.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -35,7 +35,7 @@
   "scripts": {
     "build": "node build.mjs && tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "node test/plugin.test.mjs && node test/client-loader.test.mjs",
+    "test": "node test/plugin.test.mjs && node test/wire.test.mjs && node test/responses.test.mjs && node test/client-loader.test.mjs",
     "check": "npm run typecheck && npm run build && npm test"
   },
   "keywords": [

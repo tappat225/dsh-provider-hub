@@ -323,6 +323,8 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         displayName: entry.gateway.displayName,
         baseURL: entry.gateway.baseURL,
         api: entry.gateway.api,
+        endpointMode: entry.gateway.endpointMode ?? 'auto',
+        endpoint: entry.gateway.endpoint ?? '',
         userAgent: entry.gateway.userAgent,
         apiKey: entry.gateway.apiKey,
         apiKeyEnv: entry.gateway.apiKeyEnv,
@@ -383,6 +385,8 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       displayName: cfg.displayName,
       baseURL: cfg.baseURL,
       api: cfg.api,
+      endpointMode: cfg.endpointMode ?? 'auto',
+      endpoint: cfg.endpoint ?? '',
       userAgent: cfg.userAgent,
       apiKey: cfg.apiKey,
       apiKeyEnv: cfg.apiKeyEnv,
@@ -527,12 +531,11 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   };
 
   /**
-   * Submit the add/edit form. New models: ids matching the built-in catalog
-   * are enabled as catalog entries (explicit params become field overrides);
-   * anything else is stored as a custom model (runtime enableDiscovered).
-   * Edits: custom models rewrite their entry (upsert-custom); built-in ids
-   * rewrite only their per-model override via a whole-map save (an empty
-   * field drops that override and falls back to the catalog default).
+   * Submit the add/edit form. Both paths call the host's upsert-model RPC:
+   * add inserts a new entry (overwrite=false); an edit with the same id
+   * overwrites the existing entry in place, an edit with a changed id
+   * inserts under the new id (overwrite=false) and passes originalId.
+   * clearFields stays empty — omitted form fields keep their previous values.
    */
   const submitModelForm = () => {
     const selected = state.selected;
@@ -545,17 +548,18 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     const max = addModelDraft.maxTokens.trim();
     if (editing !== null) {
       void (async () => {
-        const r = editing.custom
-          ? await call('upsert-custom', {
-            index: selected,
-            // Omitted fields keep their previous value (partial update).
-            entry: { id: editing.id, ...(name === '' ? {} : { name }), ...(ctx === '' ? {} : { contextWindow: Number(ctx) || undefined }), ...(max === '' ? {} : { maxTokens: Number(max) || undefined }) },
-            originalId: { id: editing.id },
-          })
-          : await call('save-config', {
-            index: selected,
-            patch: { modelOverrides: overrideMapWith(entry, editing.id, name, ctx, max) },
-          });
+        // Same id: overwrite the entry in place. Changed id: insert under the
+        // new id and point originalId at the old entry. Omitted form fields
+        // keep their previous value (clearFields stays empty).
+        const sameId = id === editing.id;
+        const model: Record<string, unknown> = {
+          id,
+          ...(name === '' ? {} : { name }),
+          ...(ctx === '' ? {} : { contextWindow: Number(ctx) || undefined }),
+          ...(max === '' ? {} : { maxTokens: Number(max) || undefined }),
+          ...(sameId ? {} : { originalId: editing.id }),
+        };
+        const r = await call('upsert-model', { index: selected, entry: model, overwrite: sameId, clearFields: [] });
         if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
         else {
           setStatus({ kind: 'ok', text: `${editing.id} ✓` });
@@ -576,7 +580,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         ...(ctx === '' ? {} : { contextWindow: Number(ctx) || undefined }),
         ...(max === '' ? {} : { maxTokens: Number(max) || undefined }),
       };
-      const r = await call('enable-discovered', { index: selected, model });
+      const r = await call('upsert-model', { index: selected, entry: model, overwrite: false, clearFields: [] });
       if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
       else {
         setStatus({ kind: 'ok', text: `${id} ${t('enable')} ✓` });
@@ -586,14 +590,12 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     })();
   };
 
-  /** Remove one enabled model: built-in catalog ids toggle off, custom models delete. */
+  /** Remove one enabled model. */
   const removeModel = (id: string) => {
     const selected = state.selected;
     if (selected === null) return;
     void (async () => {
-      const builtin = state.catalog[id] !== undefined;
-      const r = builtin ? await call('toggle-builtin', { index: selected, id, enabled: false })
-        : await call('delete-custom', { index: selected, id });
+      const r = await call('delete-model', { index: selected, id });
       if (!r.ok) setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
       else {
         setStatus({ kind: 'ok', text: `${id} ${t('remove')} ✓` });
@@ -738,7 +740,29 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       React.createElement('div', { className: 'phub-group' },
         fieldRow('provider', t('providerName'), t('providerNameHint')),
         fieldRow('displayName', t('displayName')),
-        fieldRow('baseURL', `${t('baseURL')} *`, t('baseURLHint'), t('baseURLPlaceholder')),
+        // baseURL meaning depends on the endpoint mode: auto = API root
+        // (/v1 auto-completed), custom = the COMPLETE model-listing URL.
+        fieldRow('baseURL', `${t('baseURL')} *`,
+          String(cfg.endpointMode ?? 'auto') === 'custom' ? t('baseURLHintCustom') : t('baseURLHint'),
+          t('baseURLPlaceholder')),
+        Row({
+          title: t('endpointMode'),
+          desc: t('endpointModeHint'),
+          control: React.createElement(SelectMenu, {
+            label: t('endpointMode'),
+            value: String(cfg.endpointMode ?? 'auto'),
+            options: [
+              { value: 'auto', title: t('endpointModeAuto') },
+              { value: 'custom', title: t('endpointModeCustom') },
+            ],
+            onChange: (next) => setField('endpointMode', next),
+          }),
+        }),
+        // custom mode: the complete chat request URL of the selected protocol,
+        // dialed verbatim (no path or /v1 is ever appended).
+        String(cfg.endpointMode ?? 'auto') === 'custom'
+          ? fieldRow('endpoint', `${t('endpoint')} *`, t('endpointHint'), t('endpointPlaceholder'))
+          : null,
         Row({
           title: t('api'),
           // MUST be a React element (createElement), never a direct call:
@@ -748,7 +772,11 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
           control: React.createElement(SelectMenu, {
             label: t('api'),
             value: String(cfg.api ?? 'anthropic-messages'),
-            options: [{ value: 'anthropic-messages', title: 'anthropic-messages' }, { value: 'openai-completions', title: 'openai-completions' }],
+            options: [
+              { value: 'anthropic-messages', title: 'anthropic-messages' },
+              { value: 'openai-completions', title: 'openai-completions' },
+              { value: 'openai-responses', title: 'openai-responses' },
+            ],
             onChange: (next) => setField('api', next),
           }),
         }),
@@ -775,12 +803,14 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         // API key: masked by default, per-provider reveal toggle.
         Row({
           title: t('apiKey'),
+          desc: cfg.apiKeyConfigured === true ? t('apiKeyConfiguredHint') : t('apiKeyHint'),
           control: React.createElement(React.Fragment, null,
             React.createElement('input', {
               className: 'phub-input',
               type: showKey[providerKey] === true ? 'text' : 'password',
               value: String(cfg.apiKey ?? ''),
-              autoComplete: 'off',
+              placeholder: cfg.apiKeyConfigured === true ? t('apiKeyConfiguredHint') : undefined,
+              autoComplete: 'new-password',
               spellCheck: false,
               onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setField('apiKey', e.target.value),
             }),
@@ -914,7 +944,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
             className: 'phub-input',
             placeholder: t('modelId'),
             value: addModelDraft.id,
-            disabled: editing !== null,
             onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setAddModelDraft((d) => ({ ...d, id: e.target.value })),
           }),
           React.createElement('input', {

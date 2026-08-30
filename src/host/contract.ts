@@ -35,6 +35,15 @@ const nullishObjectSchema = schema((v) => {
   if (v !== null && (typeof v !== 'object' || Array.isArray(v))) throw new TypeError('expected an object or null');
   return v;
 });
+const nullishStringArraySchema = schema((v) => {
+  // An absent/null clearFields means "clear nothing"; an array must be all strings.
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v)) throw new TypeError('expected an array of strings');
+  return v.map((item) => {
+    if (typeof item !== 'string') throw new TypeError('expected an array of strings');
+    return item;
+  });
+});
 const resultEnvelopeSchema = schema((v) => {
   if (v === null || typeof v !== 'object' || typeof (v as { ok?: unknown }).ok !== 'boolean') {
     throw new TypeError('expected an { ok, ... } envelope');
@@ -78,6 +87,12 @@ const nullishObjectParam = (name: string) => ({
   source: 'json',
   codec: codec('ObjectOrNull', nullishObjectSchema),
 });
+const nullishStringArrayParam = (name: string) => ({
+  name,
+  wire: name,
+  source: 'json',
+  codec: codec('StringArrayOrNull', nullishStringArraySchema),
+});
 
 /** Wire method names — the client maps these to Remote handle methods. */
 export const METHODS = {
@@ -89,6 +104,8 @@ export const METHODS = {
   saveOverrides: 'save-overrides',
   upsertCustom: 'upsert-custom',
   deleteCustom: 'delete-custom',
+  upsertModel: 'upsert-model',
+  deleteModel: 'delete-model',
   discover: 'discover',
   testConnection: 'test-connection',
   enableDiscovered: 'enable-discovered',
@@ -113,6 +130,8 @@ export const INVOCATIONS = [
   invocation('saveOverrides', 'saveOverrides', [numberParam('index'), objectParam('overrides')]),
   invocation('upsertCustom', 'upsertCustom', [numberParam('index'), objectParam('entry'), nullishObjectParam('originalId')]),
   invocation('deleteCustom', 'deleteCustom', [numberParam('index'), stringParam('id')]),
+  invocation('upsertModel', 'upsertModel', [numberParam('index'), objectParam('entry'), booleanParam('overwrite'), nullishStringArrayParam('clearFields')]),
+  invocation('deleteModel', 'deleteModel', [numberParam('index'), stringParam('id')]),
   invocation('discover', 'discover', [numberParam('index')]),
   invocation('testConnection', 'testConnection', [numberParam('index'), objectParam('draft')]),
   invocation('enableDiscovered', 'enableDiscovered', [numberParam('index'), objectParam('model')]),
@@ -139,6 +158,8 @@ export const TYPERT_MANIFEST = {
           { kind: 'method', name: 'saveOverrides', signature: 'saveOverrides(index: number, overrides: object): Promise<object>' },
           { kind: 'method', name: 'upsertCustom', signature: 'upsertCustom(index: number, entry: object, originalId: object | null): Promise<object>' },
           { kind: 'method', name: 'deleteCustom', signature: 'deleteCustom(index: number, id: string): Promise<object>' },
+          { kind: 'method', name: 'upsertModel', signature: 'upsertModel(index: number, entry: object, overwrite: boolean, clearFields: string[] | null): Promise<object>' },
+          { kind: 'method', name: 'deleteModel', signature: 'deleteModel(index: number, id: string): Promise<object>' },
           { kind: 'method', name: 'discover', signature: 'discover(index: number): Promise<object>' },
           { kind: 'method', name: 'testConnection', signature: 'testConnection(index: number, draft: object): Promise<object>' },
           { kind: 'method', name: 'enableDiscovered', signature: 'enableDiscovered(index: number, model: object): Promise<object>' },

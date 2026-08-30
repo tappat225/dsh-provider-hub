@@ -2,7 +2,8 @@
  * ProviderHubRuntime — the Typert Remote service backing the client-side
  * settings page. Reads/writes the `llm-provider-hub` settings section and
  * serves model management operations (built-in toggles, overrides, custom
- * models, preset import, discovery), each scoped to ONE gateway by index.
+ * models, unified model upsert/delete, preset import, discovery), each scoped
+ * to ONE gateway by index.
  *
  * Every method answers the business envelope `{ ok: true, ... }` or
  * `{ ok: false, error }`; the typert boundary adds its own transport
@@ -18,11 +19,12 @@
  * @module dsh-provider-hub/host/runtime
  */
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
-import type { LlmDiscoveredModel } from '@deepseek-ai/dsh-llm';
-import { MODEL_CATALOG, resolveModelEntries } from '../catalog.ts';
+import { assertUsableApiKey, type LlmDiscoveredModel } from '@deepseek-ai/dsh-llm';
+import { credentialRef } from '@deepseek-ai/dsh-credentials';
+import { MODEL_CATALOG, gatewayModelDefaults, positiveInt, resolveModelEntries } from '../catalog.ts';
 import { discoverModels } from '../discovery.ts';
 import { DEFAULT_USER_AGENT, type GatewayConfig, type WireConfig } from '../types.ts';
-import { joinEndpoint } from '../url.ts';
+import { redactUrl, resolveEndpointUrl } from '../url.ts';
 
 /** Business envelope: every method answers `{ ok, ... }` or `{ ok: false, error }`. */
 type Envelope = { ok: boolean } & Record<string, unknown>;
@@ -74,6 +76,88 @@ interface Op {
   op: 'set' | 'unset';
   path: string[];
   value?: unknown;
+}
+
+/** Reasoning-effort levels a model entry may declare (escalation order). */
+const REASONING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** A validated/normalized upsertModel payload: id (+ optional edit source id) and the fields it provides. */
+interface ValidatedModelEntry {
+  id: string;
+  /** When set: the client is EDITING this existing entry (allows an id change / rename). */
+  originalId?: string;
+  /** Provided fields only — the caller merges these over the stored entry field by field. */
+  fields: Record<string, unknown>;
+}
+
+/**
+ * Validate and normalize one model-entry payload (unified entry validation):
+ * id non-empty; name optional (trimmed, empty dropped); contextWindow/maxTokens
+ * positive integers when provided; input filtered to text/image and deduped;
+ * reasoningEfforts either `false` (non-reasoning marker) or a level->wire map
+ * whose keys are off/minimal/low/medium/high/xhigh/max, where every non-off
+ * level carries a non-empty wire value and at least one non-off level exists.
+ *
+ * Throws Error with a user-facing message; upsertModel converts it to
+ * `{ ok: false, error }` before any settings mutation, so a rejected entry
+ * never touches stored configuration.
+ */
+function validateModelEntry(raw: unknown): ValidatedModelEntry {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('model entry must be a JSON object');
+  }
+  const entry = raw as Record<string, unknown>;
+  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+  if (id === '') throw new Error('model entry needs a non-empty id');
+  const originalIdRaw = entry.originalId;
+  const originalId = typeof originalIdRaw === 'string' && originalIdRaw.trim() !== '' ? originalIdRaw.trim() : undefined;
+  const fields: Record<string, unknown> = {};
+  if (entry.name !== undefined && entry.name !== null) {
+    if (typeof entry.name !== 'string') throw new Error('name must be a string');
+    const name = entry.name.trim();
+    if (name !== '') fields.name = name;
+  }
+  for (const key of ['contextWindow', 'maxTokens'] as const) {
+    const value = entry[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      throw new Error(`${key} must be a positive integer`);
+    }
+    fields[key] = value;
+  }
+  if (entry.input !== undefined && entry.input !== null) {
+    if (!Array.isArray(entry.input)) throw new Error('input must be an array');
+    const input = [...new Set(entry.input.filter((m) => m === 'text' || m === 'image'))];
+    if (input.length > 0) fields.input = input;
+  }
+  if (entry.reasoningEfforts !== undefined && entry.reasoningEfforts !== null) {
+    if (entry.reasoningEfforts === false) {
+      fields.reasoningEfforts = false;
+    } else if (typeof entry.reasoningEfforts === 'object' && !Array.isArray(entry.reasoningEfforts)) {
+      const efforts: Record<string, string | null> = {};
+      let thinking = false;
+      for (const level of Object.keys(entry.reasoningEfforts as object)) {
+        if (!(REASONING_LEVELS as readonly string[]).includes(level)) {
+          throw new Error(`unknown reasoning level "${level}"; allowed levels: ${REASONING_LEVELS.join(', ')}`);
+        }
+        if (level === 'off') {
+          efforts.off = null;
+          continue;
+        }
+        const wire = (entry.reasoningEfforts as Record<string, unknown>)[level];
+        if (wire === null) throw new Error(`reasoningEfforts.${level} needs the wire value dispatch should send; only "off" may be empty`);
+        if (typeof wire !== 'string' || wire.trim() === '') throw new Error(`reasoningEfforts.${level} must be a non-empty string`);
+        efforts[level] = wire.trim();
+        thinking = true;
+      }
+      if (Object.keys(efforts).length === 0) throw new Error('reasoningEfforts is empty: declare at least one level, or mark the model non-reasoning with false');
+      if (!thinking) throw new Error('reasoningEfforts must include at least one non-off level');
+      fields.reasoningEfforts = efforts;
+    } else {
+      throw new Error('reasoningEfforts must be false (non-reasoning) or a { level: wireValue } map');
+    }
+  }
+  return { id, originalId, fields };
 }
 
 export class ProviderHubRuntime extends TypertRemoteService {
@@ -128,6 +212,25 @@ export class ProviderHubRuntime extends TypertRemoteService {
     return this.writeOps(st, [{ op: 'set', path: ['gateways'], value: gateways }]);
   }
 
+  /**
+   * Commit one gateway's NEXT configuration through the whole-array write —
+   * but only after the resulting model list still resolves. resolveModelEntries
+   * is the read-side contract (the adapter resolves through it on every
+   * request), so a write that would break it — e.g. a reasoning map with no
+   * spellable level — is refused here, before any settings mutation.
+   */
+  private async commitGateway(st: SettingsLike, index: number, next: GatewayConfig): Promise<Envelope> {
+    let models: ReturnType<typeof resolveModelEntries>;
+    try {
+      models = resolveModelEntries(next);
+    } catch (error) {
+      return fail(`refusing to write: the gateway's model list would not resolve — ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const config = this.deps.current();
+    await this.setGateways(st, config.gateways.map((g, i) => (i === index ? next : g)));
+    return ok({ index, models });
+  }
+
   /** Gateway at index, or undefined. */
   private gatewayAt(index: number): GatewayConfig | undefined {
     return this.deps.current().gateways[index];
@@ -142,13 +245,24 @@ export class ProviderHubRuntime extends TypertRemoteService {
       this.deps.log(
         `getState: current()=${config.gateways.length} describe=${String(liveG)} scope-user=${String(Array.isArray(view?.gateways) ? (view.gateways as unknown[]).length : 'n/a')} revision=${String(view?.revision)}`,
       );
+      const credentials = this.hostCtx.get<{
+        describe?(ref: unknown): Promise<{ configured?: boolean } | undefined>;
+      }>('credentials');
+      const publicGateways = await Promise.all(config.gateways.map(async (gw) => {
+        const { apiKey: _secret, ...safe } = gw;
+        let configured = typeof _secret === 'string' && _secret.trim() !== '';
+        try {
+          const description = credentials?.describe !== undefined
+            ? await credentials.describe(credentialRef(gw.apiKeyEnv))
+            : undefined;
+          configured ||= description?.configured === true;
+        } catch { /* an unavailable credential descriptor is not a page failure */ }
+        return { gateway: { ...safe, apiKeyConfigured: configured }, models: resolveModelEntries(gw) };
+      }));
+      const safeConfig = { gateways: publicGateways.map((item) => item.gateway) };
       return ok({
-        config,
-        gateways: config.gateways.map((gw, index) => ({
-          index,
-          gateway: gw,
-          models: resolveModelEntries(gw),
-        })),
+        config: safeConfig,
+        gateways: publicGateways.map((item, index) => ({ index, gateway: item.gateway, models: item.models })),
         catalog: MODEL_CATALOG,
       });
     } catch (error) {
@@ -173,11 +287,14 @@ export class ProviderHubRuntime extends TypertRemoteService {
         displayName: provider,
         baseURL: '',
         api: 'anthropic-messages',
+        endpointMode: 'auto',
+        endpoint: '',
         userAgent: DEFAULT_USER_AGENT,
         apiKeyEnv: 'GATEWAY_API_KEY',
         apiKey: '',
         extraHeaders: {},
         systemRole: 'system',
+        streamUsage: true,
         anthropicThinking: false,
         enabledModels: ['glm-5.3'],
         modelOverrides: {},
@@ -233,7 +350,109 @@ export class ProviderHubRuntime extends TypertRemoteService {
         }
         normalizedPatch = { ...patch, provider };
       }
-      const next = config.gateways.map((g, i) => (i === index ? ({ ...g, ...normalizedPatch } as GatewayConfig) : g));
+      // Wire-critical field validation: refuse a bad protocol value, URL, UA,
+      // or header at write time instead of failing at request time. Header
+      // names/values carrying CR/LF would let a request inject upstream
+      // headers, so they are refused here AND in the adapter (hand-edited
+      // settings.yaml skips this path).
+      if (patch.api !== undefined
+        && patch.api !== 'anthropic-messages' && patch.api !== 'openai-completions' && patch.api !== 'openai-responses') {
+        return fail('api must be "anthropic-messages", "openai-completions" or "openai-responses"');
+      }
+      if (patch.endpointMode !== undefined && patch.endpointMode !== 'auto' && patch.endpointMode !== 'custom') {
+        return fail('endpointMode must be "auto" or "custom"');
+      }
+      if (patch.endpoint !== undefined) {
+        if (typeof patch.endpoint !== 'string') return fail('endpoint must be a string');
+        const endpoint = patch.endpoint.trim();
+        if (endpoint !== '') {
+          if (/[\r\n]/.test(endpoint)) return fail('endpoint must not contain line breaks');
+          try {
+            const parsed = new URL(endpoint);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return fail('endpoint must use http or https');
+          } catch {
+            return fail('endpoint is not a valid URL');
+          }
+        }
+      }
+      if (patch.systemRole !== undefined && patch.systemRole !== 'system' && patch.systemRole !== 'developer') {
+        return fail('systemRole must be "system" or "developer"');
+      }
+      if (patch.baseURL !== undefined) {
+        if (typeof patch.baseURL !== 'string') return fail('baseURL must be a string');
+        const base = patch.baseURL.trim();
+        if (base !== '') {
+          try {
+            const parsed = new URL(base);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return fail('baseURL must use http or https');
+          } catch {
+            return fail('baseURL is not a valid URL');
+          }
+        }
+      }
+      if (patch.userAgent !== undefined) {
+        if (typeof patch.userAgent !== 'string') return fail('userAgent must be a string');
+        if (/[\r\n]/.test(patch.userAgent)) return fail('userAgent must not contain line breaks');
+      }
+      if (patch.extraHeaders !== undefined) {
+        const headers = patch.extraHeaders;
+        if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) return fail('extraHeaders must be a JSON object');
+        for (const [name, value] of Object.entries(headers)) {
+          if (typeof value !== 'string') return fail(`extraHeaders.${name} must be a string`);
+          if (/[\r\n]/.test(name) || /[\r\n]/.test(value)) return fail(`extraHeaders.${name} must not contain line breaks`);
+        }
+      }
+      if (patch.streamUsage !== undefined && typeof patch.streamUsage !== 'boolean') {
+        return fail('streamUsage must be a boolean');
+      }
+      // Model-parameter defaults: positive-integer capacities, a modality
+      // list, and a level->tokens budget dict (values feed the Anthropic
+      // budget table, so zero/negative/fractal values are refused).
+      if (patch.defaultContextWindow !== undefined && patch.defaultContextWindow !== null && !positiveInt(patch.defaultContextWindow)) {
+        return fail('defaultContextWindow must be a positive integer');
+      }
+      if (patch.defaultMaxTokens !== undefined && patch.defaultMaxTokens !== null && !positiveInt(patch.defaultMaxTokens)) {
+        return fail('defaultMaxTokens must be a positive integer');
+      }
+      if (patch.defaultInput !== undefined && patch.defaultInput !== null) {
+        if (!Array.isArray(patch.defaultInput)) return fail('defaultInput must be an array');
+        for (const modality of patch.defaultInput) {
+          if (modality !== 'text' && modality !== 'image' && modality !== 'audio') {
+            return fail('defaultInput must contain only "text", "image" or "audio"');
+          }
+        }
+      }
+      if (patch.anthropicThinkingBudgets !== undefined && patch.anthropicThinkingBudgets !== null) {
+        const budgets = patch.anthropicThinkingBudgets;
+        if (budgets === null || typeof budgets !== 'object' || Array.isArray(budgets)) {
+          return fail('anthropicThinkingBudgets must be a JSON object of level -> token budget');
+        }
+        for (const [level, tokens] of Object.entries(budgets)) {
+          if (!positiveInt(tokens)) return fail(`anthropicThinkingBudgets.${level} must be a positive integer`);
+        }
+      }
+      // API keys are write-only: store a newly entered key in credentials and
+      // never persist or forward the literal through the settings document.
+      // An empty/omitted value means "keep the existing credential".
+      const requestedApiKey = patch.apiKey;
+      const patchWithoutSecret = { ...normalizedPatch };
+      delete patchWithoutSecret.apiKey;
+      if (requestedApiKey !== undefined) {
+        if (typeof requestedApiKey !== 'string') return fail('apiKey must be a string');
+        const literal = requestedApiKey.trim();
+        if (literal !== '') {
+          const envName = typeof patchWithoutSecret.apiKeyEnv === 'string' && patchWithoutSecret.apiKeyEnv.trim() !== ''
+            ? patchWithoutSecret.apiKeyEnv.trim() : gw.apiKeyEnv;
+          try {
+            const credentials = this.hostCtx.get<{ set(ref: unknown, value: string): Promise<void> }>('credentials');
+            if (credentials === undefined) return fail('credentials service unavailable; API key was not stored');
+            await credentials.set(credentialRef(envName), assertUsableApiKey(literal, 'llm-provider-hub', envName));
+          } catch (error) {
+            return fail(error);
+          }
+        }
+      }
+      const next = config.gateways.map((g, i) => (i === index ? ({ ...g, ...patchWithoutSecret, apiKey: '' } as GatewayConfig) : g));
       await this.setGateways(st, next);
       return ok({ config: this.deps.current() });
     } catch (error) {
@@ -255,9 +474,25 @@ export class ProviderHubRuntime extends TypertRemoteService {
     }
   }
 
-  /** Replace the modelOverrides map of one gateway wholesale. */
+  /**
+   * Replace the modelOverrides map of one gateway wholesale. The resulting
+   * model list must still resolve (the same read-side contract the unified
+   * write path enforces), so a map the resolution would refuse — e.g. an
+   * off-only reasoning map — is rejected BEFORE the settings write instead of
+   * bricking the gateway's read side.
+   */
   async saveOverrides(index: number, overrides: Record<string, unknown>): Promise<Envelope> {
     try {
+      const gw = this.gatewayAt(index);
+      if (gw === undefined) return fail('gateway index out of range');
+      if (overrides === null || typeof overrides !== 'object' || Array.isArray(overrides)) {
+        return fail('modelOverrides must be a JSON object');
+      }
+      try {
+        resolveModelEntries({ ...gw, modelOverrides: overrides as GatewayConfig['modelOverrides'] });
+      } catch (error) {
+        return fail(`refusing to save: the gateway's model list would not resolve — ${error instanceof Error ? error.message : String(error)}`);
+      }
       return this.saveConfig(index, { modelOverrides: overrides });
     } catch (error) {
       return fail(error);
@@ -291,6 +526,193 @@ export class ProviderHubRuntime extends TypertRemoteService {
       if (gw === undefined) return fail('gateway index out of range');
       const custom = (gw.customModels ?? []).filter((item) => item.id !== id);
       return this.saveConfig(index, { customModels: custom });
+    } catch (error) {
+      return fail(error);
+    }
+  }
+
+  /**
+   * Unified model upsert for ONE gateway (model-edit phase 1). Dispatch is by
+   * id, mirroring the reference configurator's applyModelConfig semantics on
+   * this plugin's storage shape:
+   *
+   *   - built-in catalog id: ensures `enabledModels`, merges the provided
+   *     fields into `modelOverrides[id]` field by field, drops the fields
+   *     named in `clearFields` (they fall back to catalog inheritance), and
+   *     deletes the override entirely once it ends up empty.
+   *   - any other id: upserts a `customModels` entry; contextWindow/maxTokens
+   *     must be positive integers — a NEW custom entry gets no hard-coded
+   *     128000/8192 fallback (it may omit a capacity only when the gateway
+   *     declares the matching default, which resolution then applies), and
+   *     an EDIT keeps the previous entry's values.
+   *   - `entry.reasoningEfforts: false` declares a non-reasoning model: for a
+   *     custom entry it removes the map (resolution serves no reasoning
+   *     control); on a BUILT-IN id it is refused, because the override shape
+   *     can only express reasoning by inheritance — silently clearing would
+   *     keep the catalog's control alive while looking disabled.
+   *   - a same-id builtin/custom collision is refused explicitly (the
+   *     resolution would serve two entries with one id).
+   *   - overwrite=false refuses an already-configured target: for a custom id
+   *     that means the entry exists; for a built-in id that means it is
+   *     enabled AND already carries a non-empty override.
+   *   - `entry.originalId` (optional) marks an EDIT: renaming a custom entry
+   *     onto a fresh id forms a NEW entry and removes the old one; renaming
+   *     onto a built-in id (or between built-in ids) is refused.
+   *
+   * The write is gated on resolveModelEntries, so a configuration the read
+   * side could not resolve never lands.
+   */
+  async upsertModel(index: number, entry: Record<string, unknown>, overwrite: boolean, clearFields: unknown): Promise<Envelope> {
+    try {
+      const st = this.settings();
+      if (st === undefined) return fail('settings service unavailable');
+      if (st.writable === false) return fail('settings are read-only');
+      const gw = this.gatewayAt(index);
+      if (gw === undefined) return fail('gateway index out of range');
+      const { id, originalId, fields } = validateModelEntry(entry);
+      const clears = new Set(Array.isArray(clearFields) ? clearFields.filter((k): k is string => typeof k === 'string') : []);
+      if (MODEL_CATALOG[id] !== undefined) {
+        // ---- built-in path: enabledModels + modelOverrides[id] ----
+        if (fields.reasoningEfforts === false) {
+          return fail(`built-in model "${id}" cannot declare reasoningEfforts: false; a built-in model inherits the catalog's reasoning map unless the override clears it (clearFields: ["reasoningEfforts"])`);
+        }
+        if (originalId !== undefined && originalId !== id) {
+          return fail(MODEL_CATALOG[originalId] !== undefined
+            ? `cannot rename built-in model "${originalId}" to "${id}"; built-in model ids are fixed`
+            : `cannot rename custom model "${originalId}" onto built-in id "${id}"; configure the built-in override directly`);
+        }
+        if ((gw.customModels ?? []).some((c) => c.id === id)) {
+          return fail(`model id "${id}" is a built-in catalog model, but a custom model with the same id exists on this gateway; remove the custom entry first`);
+        }
+        const wasEnabled = (gw.enabledModels ?? []).includes(id);
+        const prevOverride = (gw.modelOverrides ?? {})[id];
+        const hadOverride = prevOverride !== undefined && prevOverride !== null && typeof prevOverride === 'object' && Object.keys(prevOverride).length > 0;
+        if (wasEnabled && hadOverride && overwrite !== true) {
+          return fail(`built-in model "${id}" already has saved overrides; confirm overwrite to merge`);
+        }
+        const enabled = new Set(gw.enabledModels ?? []);
+        enabled.add(id);
+        const overrides = { ...(gw.modelOverrides ?? {}) } as Record<string, Record<string, unknown>>;
+        const merged: Record<string, unknown> = { ...(prevOverride ?? {}) };
+        for (const key of clears) delete merged[key];
+        for (const [key, value] of Object.entries(fields)) merged[key] = value;
+        if (Object.keys(merged).length === 0) delete overrides[id];
+        else overrides[id] = merged;
+        const next: GatewayConfig = { ...gw, enabledModels: [...enabled], modelOverrides: overrides };
+        const committed = await this.commitGateway(st, index, next);
+        return committed.ok ? ok({ ...committed, model: id, kind: 'builtin', override: overrides[id] }) : committed;
+      }
+      // ---- custom path: customModels entry ----
+      if (originalId !== undefined && MODEL_CATALOG[originalId] !== undefined) {
+        return fail(`model "${originalId}" is a built-in catalog model and cannot be edited as a custom entry; configure its override instead`);
+      }
+      const custom = [...(gw.customModels ?? [])] as unknown as Array<Record<string, unknown>>;
+      const sourceId = originalId ?? id;
+      const sourceIdx = custom.findIndex((item) => item.id === sourceId);
+      if (originalId !== undefined && sourceIdx < 0) {
+        return fail(`model "${sourceId}" does not exist on this gateway; refresh and retry`);
+      }
+      const targetIdx = custom.findIndex((item) => item.id === id);
+      if (targetIdx >= 0 && overwrite !== true) {
+        return fail(`model "${id}" already exists on this gateway; confirm overwrite to replace it`);
+      }
+      // A `false` reasoningEfforts declares a non-reasoning model: with no map
+      // stored, resolution serves no reasoning control at all. Drop the
+      // marker from the built fields so the stored entry carries NO map.
+      const builtFields: Record<string, unknown> = { ...fields };
+      if (builtFields.reasoningEfforts === false) {
+        clears.add('reasoningEfforts');
+        delete builtFields.reasoningEfforts;
+      }
+      // Keep every field the caller did not send (and did not clear) from the
+      // entry being edited; a rename onto an existing id overwrites THAT
+      // entry's fields instead (mirrors the reference's kept/built merge).
+      const prevBase = targetIdx >= 0 ? custom[targetIdx] : (sourceIdx >= 0 ? custom[sourceIdx] : undefined);
+      const kept: Record<string, unknown> = {};
+      if (prevBase !== null && typeof prevBase === 'object') {
+        for (const [key, value] of Object.entries(prevBase as Record<string, unknown>)) {
+          if (key !== 'id' && !clears.has(key)) kept[key] = value;
+        }
+      }
+      const finalEntry: Record<string, unknown> = { ...kept, ...builtFields, id };
+      // Custom capacities are REQUIRED data unless this gateway declares the
+      // matching default: when `defaultContextWindow` / `defaultMaxTokens`
+      // exist, an entry may omit the capacity and resolution fills it (entry
+      // source "gateway-default"). There is no hard-coded fallback: with no
+      // gateway default the omission is refused, exactly as before. A kept
+      // value that is not a positive integer is dropped in favor of the
+      // default, refused otherwise.
+      const defaults = gatewayModelDefaults(gw);
+      for (const key of ['contextWindow', 'maxTokens'] as const) {
+        if (positiveInt(finalEntry[key])) continue;
+        if (defaults[key] !== undefined) {
+          delete finalEntry[key];
+          continue;
+        }
+        return fail(`custom model "${id}" needs a positive integer ${key} (none provided, none kept from the previous entry, and the gateway has no ${key === 'contextWindow' ? 'defaultContextWindow' : 'defaultMaxTokens'} fallback)`);
+      }
+      if (finalEntry.name !== undefined && (typeof finalEntry.name !== 'string' || (finalEntry.name as string).trim() === '')) {
+        delete finalEntry.name;
+      }
+      const nextCustom: Array<Record<string, unknown>> = [];
+      for (let i = 0; i < custom.length; i++) {
+        if (i === sourceIdx && sourceIdx !== targetIdx) continue; // renamed away: old slot removed
+        if (i === targetIdx) nextCustom.push(finalEntry); // slot replaced by the merged entry
+        else nextCustom.push(custom[i]);
+      }
+      if (targetIdx < 0) nextCustom.push(finalEntry); // new slot (create or rename to a fresh id)
+      const next: GatewayConfig = { ...gw, customModels: nextCustom as unknown as typeof gw.customModels };
+      const committed = await this.commitGateway(st, index, next);
+      return committed.ok ? ok({ ...committed, model: id, kind: 'custom', custom: finalEntry }) : committed;
+    } catch (error) {
+      return fail(error);
+    }
+  }
+
+  /**
+   * Unified model delete for ONE gateway: a built-in catalog id is removed
+   * from `enabledModels` TOGETHER with its `modelOverrides` entry; any other
+   * id is removed from `customModels`. An id unknown to the catalog but
+   * present in `enabledModels`/`modelOverrides` (hand-edited settings or a
+   * retired catalog entry) is cleaned up too, so the unified delete still
+   * works on legacy data. Unknown/unconfigured ids are refused.
+   */
+  async deleteModel(index: number, id: string): Promise<Envelope> {
+    try {
+      const st = this.settings();
+      if (st === undefined) return fail('settings service unavailable');
+      if (st.writable === false) return fail('settings are read-only');
+      const gw = this.gatewayAt(index);
+      if (gw === undefined) return fail('gateway index out of range');
+      const modelId = typeof id === 'string' ? id.trim() : '';
+      if (modelId === '') return fail('model id must not be empty');
+      let next: GatewayConfig;
+      let kind: string;
+      if (MODEL_CATALOG[modelId] !== undefined) {
+        const wasEnabled = (gw.enabledModels ?? []).includes(modelId);
+        const hadOverride = (gw.modelOverrides ?? {})[modelId] !== undefined;
+        if (!wasEnabled && !hadOverride) return fail(`built-in model "${modelId}" is not configured on this gateway`);
+        next = {
+          ...gw,
+          enabledModels: (gw.enabledModels ?? []).filter((m) => m !== modelId),
+          modelOverrides: Object.fromEntries(Object.entries(gw.modelOverrides ?? {}).filter(([key]) => key !== modelId)) as GatewayConfig['modelOverrides'],
+        };
+        kind = 'builtin';
+      } else if ((gw.customModels ?? []).some((item) => item.id === modelId)) {
+        next = { ...gw, customModels: (gw.customModels ?? []).filter((item) => item.id !== modelId) };
+        kind = 'custom';
+      } else if ((gw.enabledModels ?? []).includes(modelId) || (gw.modelOverrides ?? {})[modelId] !== undefined) {
+        next = {
+          ...gw,
+          enabledModels: (gw.enabledModels ?? []).filter((m) => m !== modelId),
+          modelOverrides: Object.fromEntries(Object.entries(gw.modelOverrides ?? {}).filter(([key]) => key !== modelId)) as GatewayConfig['modelOverrides'],
+        };
+        kind = 'orphan';
+      } else {
+        return fail(`model "${modelId}" does not exist on this gateway`);
+      }
+      const committed = await this.commitGateway(st, index, next);
+      return committed.ok ? ok({ ...committed, model: modelId, kind }) : committed;
     } catch (error) {
       return fail(error);
     }
@@ -333,13 +755,16 @@ export class ProviderHubRuntime extends TypertRemoteService {
       }
       for (const [name, value] of Object.entries(headers)) {
         if (typeof value !== 'string') return fail(`extraHeaders.${name} must be a string`);
+        if (/[\r\n]/.test(name) || /[\r\n]/.test(value)) return fail(`extraHeaders.${name} must not contain line breaks`);
       }
       const testGateway: GatewayConfig = {
         ...saved,
         provider: str(draft.provider, saved.provider),
         displayName: str(draft.displayName, saved.displayName),
         baseURL: str(draft.baseURL, saved.baseURL ?? ''),
-        api: api === 'openai-completions' || api === 'anthropic-messages' ? api : saved.api,
+        api: api === 'openai-completions' || api === 'anthropic-messages' || api === 'openai-responses' ? api : saved.api,
+        endpointMode: draft.endpointMode === 'custom' || draft.endpointMode === 'auto' ? draft.endpointMode : saved.endpointMode,
+        endpoint: str(draft.endpoint, saved.endpoint ?? ''),
         userAgent: str(draft.userAgent, saved.userAgent),
         apiKey: str(draft.apiKey, saved.apiKey),
         apiKeyEnv: str(draft.apiKeyEnv, saved.apiKeyEnv),
@@ -357,14 +782,30 @@ export class ProviderHubRuntime extends TypertRemoteService {
         return fail('Base URL is not a valid URL');
       }
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return fail('Base URL must use http or https');
+      if (/[\r\n]/.test(testGateway.userAgent)) return fail('userAgent must not contain line breaks');
+      const endpoint = (testGateway.endpoint ?? '').trim();
+      if (endpoint !== '') {
+        if (/[\r\n]/.test(endpoint)) return fail('endpoint must not contain line breaks');
+        try {
+          const parsedEndpoint = new URL(endpoint);
+          if (parsedEndpoint.protocol !== 'http:' && parsedEndpoint.protocol !== 'https:') return fail('endpoint must use http or https');
+        } catch {
+          return fail('endpoint is not a valid URL');
+        }
+      }
       const started = Date.now();
+      // The probe dials through the same unified resolver as the live adapter:
+      // auto mode derives {baseURL}/models with /v1 normalization; custom mode
+      // dials baseURL verbatim as the complete models URL.
+      const resolved = resolveEndpointUrl({ baseURL, endpointMode: testGateway.endpointMode }, '/models');
+      if (!resolved.ok) return fail(resolved.error);
       const models = await discoverModels(
         { baseURL, signal: controller.signal },
         testGateway,
         () => this.deps.resolveApiKey(testGateway),
       );
       return ok({
-        endpoint: joinEndpoint(baseURL, '/models'),
+        endpoint: redactUrl(resolved.url),
         latencyMs: Date.now() - started,
         modelCount: models.length,
         models,
@@ -412,14 +853,18 @@ export class ProviderHubRuntime extends TypertRemoteService {
         next = { ...gw, ...patch };
         kind = 'builtin';
       } else {
-        // Non-catalog: insert as custom model.
+        // Non-catalog: insert as custom model. Capacities come from the
+        // discovery payload when disclosed; an undisclosed capacity is NOT
+        // hard-coded (no 128000/8192 invention) — the entry omits it and
+        // resolution fills it from the gateway's defaults, or leaves it
+        // undefined when the gateway declares none.
         const custom = [...(gw.customModels ?? [])] as unknown as Array<Record<string, unknown>>;
         if (custom.some((item) => item.id === id)) return ok({ enabled: id, kind: 'custom-existing' });
         const entry: Record<string, unknown> = {
           id,
           name: typeof model.name === 'string' && model.name.trim() !== '' ? model.name : id,
-          contextWindow: typeof model.contextWindow === 'number' && Number.isFinite(model.contextWindow) ? model.contextWindow : 128000,
-          maxTokens: typeof model.maxTokens === 'number' && Number.isFinite(model.maxTokens) ? model.maxTokens : 8192,
+          ...(positiveInt(model.contextWindow) ? { contextWindow: model.contextWindow as number } : {}),
+          ...(positiveInt(model.maxTokens) ? { maxTokens: model.maxTokens as number } : {}),
         };
         custom.push(entry);
         next = { ...gw, customModels: custom as unknown as typeof gw.customModels };

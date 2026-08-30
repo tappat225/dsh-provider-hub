@@ -59,22 +59,41 @@ const GatewaySchema = z.object({
   provider: z.string(),
   /** Display name in model pickers. */
   displayName: z.string().default(DEFAULT_DISPLAY_NAME),
-  /** Upstream base URL (required; the request path is appended automatically). */
+  /** Upstream base URL (auto: API root; custom: the complete model-listing URL). */
   baseURL: z.string(),
   /** Wire protocol. */
-  api: z.union(['anthropic-messages', 'openai-completions']).default('anthropic-messages'),
+  api: z.union(['anthropic-messages', 'openai-completions', 'openai-responses']).default('anthropic-messages'),
+  /**
+   * Endpoint addressing mode. auto (default; older stored configs behave as
+   * auto): the /v1-normalized request paths are derived from baseURL. custom:
+   * no path is appended — `endpoint` is the complete chat request URL and
+   * `baseURL` the complete model-listing URL, both used verbatim.
+   */
+  endpointMode: z.union(['auto', 'custom']).default('auto'),
+  /** Complete chat request URL used verbatim in custom mode (per the gateway's api). */
+  endpoint: z.string().default(''),
   /** User-Agent sent on the wire (gateway whitelist; empty falls back to the default). */
   userAgent: z.string().default(DEFAULT_USER_AGENT),
   /** Credential-ref env var name; resolved through the credentials service or launch environment. */
   apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV),
-  /** Literal key, optional; takes precedence over apiKeyEnv. */
-  apiKey: z.string(),
+  /** Literal key, optional; accepted only for legacy migration and never returned to the client. */
+  apiKey: z.string().role('secret'),
   /** Extra headers merged into every request. */
   extraHeaders: z.dict(z.string()).default({}),
   /** Role used for the system prompt on the openai-completions path ('developer' fixes strict GPT-lineage gateways). */
   systemRole: z.union(['system', 'developer']).default('system'),
+  /** Request the final usage chunk on the openai-completions path (stream_options.include_usage; disable for gateways that reject the parameter). */
+  streamUsage: z.boolean().default(true),
   /** When true, the anthropic-messages path forwards reasoningEffort as Anthropic `thinking` (budget_tokens by effort). */
   anthropicThinking: z.boolean().default(false),
+  /** Default context window for custom models that omit contextWindow (optional: unset means no gateway fallback). */
+  defaultContextWindow: z.number().step(1).min(1),
+  /** Default per-request output cap (fills custom entries without maxTokens and requests DSH sends without one; unset keeps the 4096 floor). */
+  defaultMaxTokens: z.number().step(1).min(1),
+  /** Default input modalities for custom models that omit input. */
+  defaultInput: z.array(z.union(['text', 'image', 'audio'])),
+  /** Anthropic thinking budget (tokens) per reasoning level; unset levels fall back to the adapter's built-in table. */
+  anthropicThinkingBudgets: z.dict(z.number().step(1).min(1)),
   /** Field-level parameter overrides for built-in catalog models (id -> partial entry). */
   modelOverrides: z.dict(z.object({
     name: z.string(),
@@ -91,7 +110,7 @@ const GatewaySchema = z.object({
     name: z.string(),
     contextWindow: z.number().step(1).min(1),
     maxTokens: z.number().step(1).min(1),
-    input: z.array(z.union(['text', 'image', 'audio'])).default(['text']),
+    input: z.array(z.union(['text', 'image', 'audio'])),
     reasoningEfforts: z.dict(z.union([z.string(), z.const(null)])),
   })).default([]),
 });
@@ -112,23 +131,38 @@ export function apply(ctx: Context, config: WireConfig) {
   // bind while the plugin still runs would prove the settings fiber was
   // disposed/recreated (the suspected "list empty" root cause).
   let settingsBind = 0;
+  /** Legacy literal keys captured before settings redaction; keyed by credential ref. */
+  const legacyLiteralKeys = new Map<string, string>();
+  for (const gw of config.gateways) {
+    if (typeof gw.apiKey === 'string' && gw.apiKey.trim() !== '') legacyLiteralKeys.set(gw.apiKeyEnv, gw.apiKey.trim());
+  }
 
   /** Gateway by provider route (cached per current() call). */
   const gatewayFor = (provider: string): GatewayConfig | undefined =>
     current().gateways.find((gw) => gw.provider === provider);
 
   const resolveApiKey = async (gw: GatewayConfig): Promise<string> => {
-    if (typeof gw.apiKey === 'string' && gw.apiKey.trim() !== '') {
-      return assertUsableApiKey(gw.apiKey.trim(), 'llm-provider-hub', 'config.apiKey');
-    }
-    const ref = credentialRef(gw.apiKeyEnv ?? DEFAULT_API_KEY_ENV);
+    const refName = gw.apiKeyEnv ?? DEFAULT_API_KEY_ENV;
+    const ref = credentialRef(refName);
     const credentials = ctx.get('credentials');
-    const hit = credentials !== undefined
-      ? (await credentials.resolve(ref))?.value
-      : launchEnvironmentOf(ctx).get(ref)?.value;
-    if (hit !== undefined && hit.length > 0) return assertUsableApiKey(hit, 'llm-provider-hub', gw.apiKeyEnv);
+    // Credentials are authoritative after migration or a later key rotation.
+    const stored = credentials !== undefined ? (await credentials.resolve(ref))?.value : undefined;
+    if (stored !== undefined && stored.length > 0) return assertUsableApiKey(stored, 'llm-provider-hub', refName);
+    const literal = typeof gw.apiKey === 'string' && gw.apiKey.trim() !== ''
+      ? gw.apiKey.trim() : legacyLiteralKeys.get(refName);
+    if (literal !== undefined) {
+      const key = assertUsableApiKey(literal, 'llm-provider-hub', refName);
+      // Migrate legacy settings literals on first use. Failure to persist does
+      // not break the current request; the literal remains an internal fallback.
+      if (credentials !== undefined) {
+        try { await credentials.set(ref, key); legacyLiteralKeys.delete(refName); } catch { /* request can still use the validated legacy key */ }
+      }
+      return key;
+    }
+    const hit = launchEnvironmentOf(ctx).get(ref)?.value;
+    if (hit !== undefined && hit.length > 0) return assertUsableApiKey(hit, 'llm-provider-hub', refName);
     throw new LlmError(
-      `llm-provider-hub: no API key for provider route "${gw.provider}"; set config.apiKey in the plugin settings, store ${gw.apiKeyEnv} in the credentials service, or export it in the launching environment`,
+      `llm-provider-hub: no API key for provider route "${gw.provider}"; set the API key in the plugin settings, store ${refName} in the credentials service, or export it in the launching environment`,
       'MISSING_CREDENTIAL',
     );
   };
@@ -238,6 +272,14 @@ export function apply(ctx: Context, config: WireConfig) {
         }>;
       };
       const scope = s.register(NS, Config, { base: config });
+      // Capture literals from the user settings layer before describe() redacts
+      // secret fields. They are only an internal migration fallback and are
+      // transferred to credentials on first request.
+      try {
+        for (const gw of scope.get().gateways) {
+          if (typeof gw.apiKey === 'string' && gw.apiKey.trim() !== '') legacyLiteralKeys.set(gw.apiKeyEnv, gw.apiKey.trim());
+        }
+      } catch { /* a malformed/disposed scope is handled by the normal fallback */ }
       settingsBind += 1;
       const bindMark = settingsBind;
       /** Live read: describe() mirrors the current map registration; the

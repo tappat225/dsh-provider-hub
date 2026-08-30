@@ -6,6 +6,7 @@
  * @module dsh-provider-hub/types
  */
 import type { ModelModality } from '@deepseek-ai/dsh-llm';
+import type { EndpointMode } from './url.ts';
 
 /** User-Agent used when a gateway leaves the field empty (schema default). */
 export const DEFAULT_USER_AGENT = 'claude-cli/2.0.1 (external, cli)';
@@ -29,15 +30,24 @@ export interface ModelOverride {
   reasoningEfforts?: ReasoningEffortMap;
 }
 
-/** Fully-specified custom model entries (Cherry-Studio style manual entries). */
+/**
+ * Custom model entries (Cherry-Studio style manual entries). Capacities are
+ * optional in stored configurations: when a custom entry omits them, the
+ * gateway's `defaultContextWindow` / `defaultMaxTokens` fill them at
+ * resolution (entry source `gateway-default`) — there is no hard-coded
+ * fallback anywhere in the read path.
+ */
 export interface CustomModel {
   id: string;
   name?: string;
-  contextWindow: number;
-  maxTokens: number;
+  contextWindow?: number;
+  maxTokens?: number;
   input?: ModelModality[];
   reasoningEfforts?: ReasoningEffortMap;
 }
+
+/** The wire protocols a gateway can speak. */
+export type WireApi = 'anthropic-messages' | 'openai-completions' | 'openai-responses';
 
 /**
  * One gateway (provider route) configuration. Mirrors the per-gateway object
@@ -48,10 +58,22 @@ export interface GatewayConfig {
   provider: string;
   /** Display name in model pickers. */
   displayName: string;
-  /** Upstream base URL (required; the request path is appended automatically). */
+  /** Upstream base URL. In auto mode an API root; in custom mode the complete model-listing URL. */
   baseURL?: string;
   /** Wire protocol. */
-  api: 'anthropic-messages' | 'openai-completions';
+  api: WireApi;
+  /**
+   * Endpoint addressing mode (see url.ts). Absent means `auto`: stored
+   * configurations saved before the field existed keep the /v1
+   * auto-normalization behavior.
+   */
+  endpointMode?: EndpointMode;
+  /**
+   * Complete chat-style request URL used verbatim in custom mode — the
+   * /chat/completions, /responses, or /messages address of whatever protocol
+   * `api` names. Unused in auto mode.
+   */
+  endpoint?: string;
   /** User-Agent sent on the wire (gateway whitelist). */
   userAgent: string;
   /** Credential-ref env var name; resolved through the credentials service or launch environment. */
@@ -62,8 +84,36 @@ export interface GatewayConfig {
   extraHeaders: Record<string, string>;
   /** Role used for the system prompt on the openai-completions path. */
   systemRole: 'system' | 'developer';
+  /**
+   * When false, openai-completions streaming omits `stream_options.include_usage`
+   * (strict gateways that reject the parameter). Default: request the final
+   * usage chunk. Treated as true when absent (configurations saved before the
+   * field existed).
+   */
+  streamUsage?: boolean;
   /** When true, the anthropic-messages path forwards reasoningEffort as Anthropic `thinking`. */
   anthropicThinking: boolean;
+  /**
+   * Default context window for custom model entries that omit `contextWindow`.
+   * Optional: absent means no gateway fallback (a custom entry must then carry
+   * its own capacity; resolution serves none). Old configurations without the
+   * field keep their previous behavior.
+   */
+  defaultContextWindow?: number;
+  /**
+   * Default per-request output cap. Fills a custom entry's absent `maxTokens`
+   * at resolution and backs the adapter's request default when DSH sends no
+   * maxTokens. Optional; absent keeps the historical 4096 floor.
+   */
+  defaultMaxTokens?: number;
+  /** Default input modalities for custom entries that omit `input` (legacy fallback: text). */
+  defaultInput?: ModelModality[];
+  /**
+   * Anthropic thinking budget (tokens) per reasoning level, overriding the
+   * adapter's built-in per-level table. Unset levels — and an unset field —
+   * fall back to the built-in table.
+   */
+  anthropicThinkingBudgets?: Record<string, number>;
   /** Built-in catalog model ids to enable in the picker. */
   enabledModels: string[];
   /** Field-level parameter overrides for built-in catalog models (id -> partial entry). */
@@ -80,14 +130,40 @@ export interface WireConfig {
   gateways: GatewayConfig[];
 }
 
+/**
+ * Where one resolved model entry's parameters come from:
+ *
+ *   - `catalog`: built-in entry serving the built-in catalog values;
+ *   - `override`: built-in entry with a field-level `modelOverrides` entry applied;
+ *   - `custom`: custom model entry whose contextWindow/maxTokens are both explicit;
+ *   - `gateway-default`: custom entry with at least one capacity filled from the
+ *     gateway's `defaultContextWindow` / `defaultMaxTokens`.
+ */
+export type WireModelSource = 'catalog' | 'override' | 'custom' | 'gateway-default';
+
 /** One resolved model entry after catalog + overrides + custom merging. */
 export interface WireModelEntry {
   id: string;
   name: string;
-  contextWindow: number;
-  maxTokens: number;
+  /**
+   * Resolved context window: the catalog/override value, the custom entry's
+   * explicit value, or the gateway default. Undefined only when a custom entry
+   * carries no capacity and the gateway declares no default.
+   */
+  contextWindow?: number;
+  /** Same resolution chain as `contextWindow`. */
+  maxTokens?: number;
   input?: ModelModality[];
   reasoning?: ReasoningEffortMap;
+  /** Origin of the entry's parameters (see {@link WireModelSource}). */
+  source: WireModelSource;
+  /**
+   * True when `maxTokens` is a user-declared capacity (an override or custom
+   * entry field) rather than an inherited catalog/gateway value. The adapter
+   * serves `defaultMaxTokens` ONLY from explicit capacities or gateway
+   * defaults — never from an inherited catalog value.
+   */
+  maxTokensExplicit?: boolean;
 }
 
 /** Provider-neutral message shape accepted by the wire converters. */

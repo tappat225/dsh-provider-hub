@@ -1,7 +1,8 @@
 /**
  * Built-in mainstream model catalog (Cherry-Studio-style capability table)
  * and model-entry resolution (catalog + field-level overrides + custom
- * models). All functions operate on ONE gateway's config — the plugin routes
+ * models, with gateway-level defaults filling absent custom capacities).
+ * All functions operate on ONE gateway's config — the plugin routes
  * each provider request to its gateway first, then resolves models within it.
  *
  * `reasoning` maps offered effort ids to their wire spellings: the KEY is the
@@ -24,6 +25,33 @@ interface CatalogEntry {
   maxTokens: number;
   input: ModelModality[];
   reasoning?: ReasoningEffortMap;
+}
+
+/** Whether a number is a usable capacity: a positive integer (schemastery leaves absent optionals undefined; hand-edited configs may carry junk). */
+export function positiveInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+/** The gateway-level model defaults (validated snapshot; unset/invalid fields dropped). */
+export interface GatewayModelDefaults {
+  contextWindow?: number;
+  maxTokens?: number;
+  input?: ModelModality[];
+}
+
+/**
+ * One gateway's model-parameter defaults (`defaultContextWindow`,
+ * `defaultMaxTokens`, `defaultInput`), validated: junk values behave as unset
+ * so a hand-edited config can never crash resolution. Shared by the read side
+ * (resolution) and the write side (model RPCs) so both agree on what
+ * "the gateway's defaults" are.
+ */
+export function gatewayModelDefaults(gw: GatewayConfig): GatewayModelDefaults {
+  return {
+    ...(positiveInt(gw.defaultContextWindow) ? { contextWindow: gw.defaultContextWindow } : {}),
+    ...(positiveInt(gw.defaultMaxTokens) ? { maxTokens: gw.defaultMaxTokens } : {}),
+    ...(Array.isArray(gw.defaultInput) && gw.defaultInput.length > 0 ? { input: [...(gw.defaultInput as ModelModality[])] } : {}),
+  };
 }
 
 /** Built-in catalog: id -> capability entry. */
@@ -179,15 +207,30 @@ function assertValidReasoningMap(gateway: string, model: string, map: ReasoningE
 
 /**
  * Resolve every model one gateway serves: enabled built-in catalog entries
- * (with field-level `modelOverrides`) and fully-specified custom models.
+ * (with field-level `modelOverrides`) and custom models.
+ *
+ * Custom entries without explicit capacities fall back to the gateway's
+ * `defaultContextWindow` / `defaultMaxTokens` / `defaultInput` — never to any
+ * hard-coded value; an entry with neither explicit nor default capacities
+ * resolves with the field undefined (the adapter then omits it). Every entry
+ * carries a `source` tag telling catalog / override / custom /
+ * gateway-default apart, and `maxTokensExplicit` marks a user-declared
+ * maxTokens (the adapter serves `defaultMaxTokens` only from those).
  */
 export function resolveModelEntries(gw: GatewayConfig): WireModelEntry[] {
   const out: WireModelEntry[] = [];
   const overrides = gw.modelOverrides ?? {};
   for (const id of gw.enabledModels ?? []) {
     const entry = MODEL_CATALOG[id];
-    if (entry === undefined) continue;
+    if (entry === undefined) continue; // unknown enabled ids keep read-side compat: skipped, not fatal
     const ov = overrides[id];
+    const applied = ov === undefined || isUnset(ov) ? undefined : {
+      ...(isUnset(ov.name) ? {} : { name: ov.name }),
+      ...(isUnset(ov.contextWindow) ? {} : { contextWindow: ov.contextWindow as number }),
+      ...(isUnset(ov.maxTokens) ? {} : { maxTokens: ov.maxTokens as number }),
+      ...(isUnset(ov.input) ? {} : { input: [...(ov.input as ModelModality[])] }),
+      ...(isUnset(ov.reasoningEfforts) ? {} : { reasoning: ov.reasoningEfforts as ReasoningEffortMap }),
+    };
     out.push({
       id,
       name: entry.name,
@@ -195,23 +238,26 @@ export function resolveModelEntries(gw: GatewayConfig): WireModelEntry[] {
       maxTokens: entry.maxTokens,
       input: [...entry.input],
       reasoning: entry.reasoning,
-      ...(ov === undefined ? {} : {
-        ...(isUnset(ov.name) ? {} : { name: ov.name }),
-        ...(isUnset(ov.contextWindow) ? {} : { contextWindow: ov.contextWindow as number }),
-        ...(isUnset(ov.maxTokens) ? {} : { maxTokens: ov.maxTokens as number }),
-        ...(isUnset(ov.input) ? {} : { input: [...(ov.input as ModelModality[])] }),
-        ...(isUnset(ov.reasoningEfforts) ? {} : { reasoning: ov.reasoningEfforts as ReasoningEffortMap }),
-      }),
+      ...(applied ?? {}),
+      source: applied === undefined ? 'catalog' : 'override',
+      ...(applied?.maxTokens !== undefined ? { maxTokensExplicit: true } : {}),
     });
   }
+  const defaults = gatewayModelDefaults(gw);
   for (const custom of gw.customModels ?? []) {
+    const explicitCtx = positiveInt(custom.contextWindow);
+    const explicitMax = positiveInt(custom.maxTokens);
+    const contextWindow = explicitCtx ? custom.contextWindow : defaults.contextWindow;
+    const maxTokens = explicitMax ? custom.maxTokens : defaults.maxTokens;
     out.push({
       id: custom.id,
       name: custom.name || custom.id,
-      contextWindow: custom.contextWindow,
-      maxTokens: custom.maxTokens,
-      input: custom.input ?? ['text'],
+      contextWindow,
+      maxTokens,
+      input: Array.isArray(custom.input) && custom.input.length > 0 ? [...custom.input] : (defaults.input ?? ['text']),
       reasoning: custom.reasoningEfforts,
+      source: explicitCtx && explicitMax ? 'custom' : 'gateway-default',
+      ...(explicitMax ? { maxTokensExplicit: true } : {}),
     });
   }
   // Resolution is the earliest point that can name a malformed map: refuse it

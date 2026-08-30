@@ -8,28 +8,115 @@
  *
  * @module dsh-provider-hub/wire/openai
  */
-import type { StreamChunk, ToolSchema, TokenUsage } from '@deepseek-ai/dsh-llm';
+import type { ContentBlock, StreamChunk, ToolSchema, TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { OpenAIChatChunk, OpenAIChatUsage, WireInputMessage } from '../types.ts';
 import { errorFinish, iterateSse } from './sse.ts';
 
-/** Convert DSH provider-neutral messages into OpenAI chat messages (plain text). */
-export function toOpenAIMessages(messages: readonly WireInputMessage[]): Array<{ role: string; content: string }> {
-  return messages.map((message) => {
-    const blocks = typeof message.content === 'string'
-      ? [{ type: 'text' as const, text: message.content }]
-      : (message.content as Array<{ type?: string; text?: string; callId?: string; content?: unknown }>);
-    const text = (blocks ?? []).map((block) => {
-      if (block.type === 'text') return block.text ?? '';
-      if (block.type === 'reasoning') return '';
-      if (block.type === 'tool-call') return '';
-      if (block.type === 'tool-result') {
-        const payload = typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? '');
-        return `[tool result of ${block.callId ?? '?'}: ${payload}]`;
+/**
+ * One OpenAI chat wire message (the subset this adapter emits). Tool
+ * correlation follows the OpenAI protocol: an assistant message that requests
+ * tool executions carries `tool_calls[]`, and every result comes back as its
+ * own `role: 'tool'` message with `tool_call_id` set to the matching call id.
+ */
+export interface OpenAIWireMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  /** Text content; `null` on assistant messages that only carry tool_calls. */
+  content: string | null;
+  /** Present on assistant messages that request tool executions. */
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+  /** Present on tool-role messages; correlates with the assistant call id. */
+  tool_call_id?: string;
+}
+
+/** Tool correlation id off a tool-result block, tolerating a legacy `callId` spelling. */
+function toolResultCallId(block: Extract<ContentBlock, { type: 'tool-result' }>): string {
+  const structural = block as unknown as { toolCallId?: unknown; callId?: unknown };
+  const id = structural.toolCallId ?? structural.callId;
+  return typeof id === 'string' ? id : '';
+}
+
+/** Serialize tool-result content into the flat text a `tool` message carries. */
+function toolResultText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (part !== null && typeof part === 'object' && (part as { type?: unknown }).type === 'text') {
+        return String((part as { text?: unknown }).text ?? '');
       }
-      return '';
-    }).filter((part) => part.length > 0).join('\n');
-    return { role: message.role === 'assistant' ? 'assistant' : 'user', content: text };
-  });
+      return JSON.stringify(part);
+    }).join('\n');
+  }
+  return JSON.stringify(content ?? '');
+}
+
+/** OpenAI expects a JSON-object string even when the model produced no arguments. */
+function toolArguments(arguments_: string | undefined): string {
+  return arguments_ === undefined || arguments_.trim() === '' ? '{}' : arguments_;
+}
+
+/**
+ * Convert DSH provider-neutral messages into OpenAI chat messages. Multi-turn
+ * tool use maps losslessly onto the OpenAI protocol: assistant `tool-call`
+ * blocks become `tool_calls`, user `tool-result` blocks become one `tool`
+ * message per call id, text blocks keep their roles, reasoning blocks are
+ * dropped (no OpenAI replay slot), and image blocks carry no inline payload.
+ */
+export function toOpenAIMessages(messages: readonly WireInputMessage[]): OpenAIWireMessage[] {
+  const wire: OpenAIWireMessage[] = [];
+  for (const message of messages) {
+    const raw = message.content;
+    const blocks: readonly ContentBlock[] = typeof raw === 'string'
+      ? [{ type: 'text', text: raw }]
+      : Array.isArray(raw) ? (raw as readonly ContentBlock[]) : [];
+    if (message.role === 'assistant') {
+      const texts: string[] = [];
+      const toolCalls: NonNullable<OpenAIWireMessage['tool_calls']> = [];
+      for (const block of blocks) {
+        if (block.type === 'text') {
+          if (block.text !== '') texts.push(block.text);
+        } else if (block.type === 'tool-call') {
+          toolCalls.push({
+            id: block.id,
+            type: 'function',
+            function: { name: block.name, arguments: toolArguments(block.arguments) },
+          });
+        }
+        // reasoning / image blocks have no OpenAI wire representation here.
+      }
+      if (texts.length > 0 || toolCalls.length > 0) {
+        wire.push({
+          role: 'assistant',
+          content: texts.length > 0 ? texts.join('\n') : null,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        });
+      }
+      continue;
+    }
+    // user/system: text accumulates into one message; every tool-result
+    // becomes its own `tool` message so tool_call_id correlation stays intact.
+    const role = message.role === 'system' ? 'system' : 'user';
+    let texts: string[] = [];
+    const flushText = (): void => {
+      if (texts.length > 0) {
+        wire.push({ role, content: texts.join('\n') });
+        texts = [];
+      }
+    };
+    for (const block of blocks) {
+      if (block.type === 'text') {
+        if (block.text !== '') texts.push(block.text);
+      } else if (block.type === 'tool-result') {
+        flushText();
+        wire.push({ role: 'tool', tool_call_id: toolResultCallId(block), content: toolResultText(block.content) });
+      }
+    }
+    flushText();
+  }
+  return wire;
 }
 
 /** OpenAI function-tool shape. */
