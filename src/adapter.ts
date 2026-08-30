@@ -115,6 +115,39 @@ export class GatewayAdapter extends LlmAdapter {
       yield errorFinish(`llm-provider-hub: baseURL is not set for gateway "${provider}"; configure it in the plugin settings`);
       return;
     }
+    // Dispatch needs the model's reasoning-effort map, so the entry must
+    // resolve before any credential work — and a model that is not enabled
+    // fails here with the same message resolveModel would throw.
+    const entry = catalogEntryFor(gw, options.model);
+    if (entry === undefined) {
+      yield errorFinish(
+        `llm-provider-hub: model "${options.model}" is not enabled on gateway "${provider}"; enable it in the provider-hub plugin settings`,
+        'UNKNOWN_MODEL',
+      );
+      return;
+    }
+    // Effort resolution per the reasoning map's semantics (key = selector
+    // level, value = wire spelling): a level the map does not declare is
+    // refused BEFORE network I/O instead of reaching the gateway; a valueless
+    // `off` sends nothing; `off` with a value sends that value; every other
+    // declared level dispatches its wire spelling.
+    const effort = options.reasoningEffort as string | undefined;
+    let wireEffort: string | undefined;
+    let thinkingLevel: string | undefined;
+    if (effort !== undefined) {
+      const map = entry.reasoning;
+      if (map === undefined || !Object.prototype.hasOwnProperty.call(map, effort)) {
+        const offered = map === undefined ? 'none' : Object.keys(map).join(', ');
+        yield errorFinish(
+          `llm-provider-hub: model "${options.model}" on gateway "${provider}" does not support reasoning effort "${effort}" (offered: ${offered})`,
+          'UNSUPPORTED_REASONING_EFFORT',
+        );
+        return;
+      }
+      const wire = map[effort];
+      if (typeof wire === 'string') wireEffort = wire;
+      if (effort !== 'off') thinkingLevel = effort;
+    }
     let apiKey: string;
     try {
       apiKey = await this.deps.resolveApiKey(gw);
@@ -128,13 +161,15 @@ export class GatewayAdapter extends LlmAdapter {
     };
     const baseURL = gw.baseURL.replace(/\/+$/, '');
     if (gw.api === 'openai-completions') {
-      yield* this.streamOpenAI(options, gw, baseURL, headers, apiKey);
+      yield* this.streamOpenAI(options, gw, baseURL, headers, apiKey, wireEffort);
       return;
     }
-    yield* this.streamAnthropic(options, gw, baseURL, headers, apiKey);
+    yield* this.streamAnthropic(options, gw, baseURL, headers, apiKey, thinkingLevel);
   }
 
+  /** Anthropic thinking budget (tokens) per selector level. */
   private static readonly ANTHROPIC_THINKING_BUDGET: Record<string, number> = {
+    minimal: 512,
     low: 1024,
     medium: 4096,
     high: 8192,
@@ -142,25 +177,32 @@ export class GatewayAdapter extends LlmAdapter {
     max: 24576,
   };
 
-  private anthropicThinkingFor(effort: string): { type: 'enabled'; budget_tokens: number } | undefined {
-    if (effort === 'off') return undefined;
-    const budget = GatewayAdapter.ANTHROPIC_THINKING_BUDGET[effort] ?? 4096;
-    return { type: 'enabled', budget_tokens: budget };
-  }
-
   private async *streamAnthropic(
     options: GenerateOptions,
     gw: GatewayConfig,
     baseURL: string,
     headers: Record<string, string>,
     apiKey: string,
+    thinkingLevel: string | undefined,
   ): AsyncGenerator<StreamChunk> {
-    // When anthropicThinking is enabled, map reasoningEffort -> Anthropic thinking.
-    // Anthropic requires max_tokens > budget_tokens; adjust upward when needed.
-    const effort = options.reasoningEffort as string | undefined;
-    const thinking = gw.anthropicThinking && effort !== undefined && effort !== 'off'
-      ? this.anthropicThinkingFor(effort)
-      : undefined;
+    // When anthropicThinking is enabled, the validated effort level maps to
+    // Anthropic thinking through the budget table. Anthropic requires
+    // max_tokens > budget_tokens; adjust upward when needed. An effort whose
+    // level has no budget mapping is refused before the request instead of
+    // silently taking a fallback budget.
+    let thinking: { type: 'enabled'; budget_tokens: number } | undefined;
+    if (gw.anthropicThinking && thinkingLevel !== undefined) {
+      const budget = GatewayAdapter.ANTHROPIC_THINKING_BUDGET[thinkingLevel];
+      if (budget === undefined) {
+        yield errorFinish(
+          `llm-provider-hub: model "${options.model}" declares effort "${thinkingLevel}", but the anthropicThinking passthrough has no budget mapped for it`
+            + ` (mapped levels: ${Object.keys(GatewayAdapter.ANTHROPIC_THINKING_BUDGET).join(', ')}); use a standard level or disable anthropicThinking`,
+          'UNSUPPORTED_REASONING_EFFORT',
+        );
+        return;
+      }
+      thinking = { type: 'enabled', budget_tokens: budget };
+    }
     let maxTokens = options.maxTokens ?? 4096;
     if (thinking !== undefined && maxTokens <= thinking.budget_tokens) {
       maxTokens = thinking.budget_tokens + 1024;
@@ -196,15 +238,18 @@ export class GatewayAdapter extends LlmAdapter {
     baseURL: string,
     headers: Record<string, string>,
     apiKey: string,
+    wireEffort: string | undefined,
   ): AsyncGenerator<StreamChunk> {
-    const reasoningEffort = options.reasoningEffort;
     const converted = toOpenAIMessages(options.messages);
     const system = options.system;
     const body = {
       model: options.model,
       max_tokens: options.maxTokens ?? 4096,
       ...(options.temperature === undefined ? {} : { temperature: options.temperature }),
-      ...(reasoningEffort !== undefined && reasoningEffort !== 'off' ? { reasoning_effort: reasoningEffort } : {}),
+      // The declared wire spelling, not the canonical level id: a map like
+      // `{ high: 'ultra' }` sends `reasoning_effort: "ultra"`; a valueless
+      // `off` (and no effort at all) omits the parameter.
+      ...(wireEffort === undefined ? {} : { reasoning_effort: wireEffort }),
       messages: system === undefined ? converted : [{ role: gw.systemRole, content: system }, ...converted],
       ...(options.tools !== undefined && options.tools.length > 0 ? { tools: toOpenAITools(options.tools) } : {}),
       stream: true,

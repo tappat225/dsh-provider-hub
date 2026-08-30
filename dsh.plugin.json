@@ -1,5 +1,5 @@
 {
-  "id": "dsh-provider-hub",
+  "id": "@tappat225/dsh-provider-hub",
   "version": "0.5.0",
   "main": "lib/index.js",
   "description": "DSH LLM provider hub: register gateway routes with their own settings panel, built-in mainstream model catalog, custom User-Agent for UA-whitelisted gateways, model overrides and live model discovery.",

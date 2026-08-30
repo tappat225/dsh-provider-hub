@@ -1,5 +1,9 @@
-# dsh-provider-hub bundle patch: mount the plugin when the package is
-# installed as a bundle (`dsh plugin --profile <profile> add ...`).
+# @tappat225/dsh-provider-hub bundle patch: mount the plugin when the package
+# is installed as a bundle (`dsh plugin --profile <profile> add ...`).
+# `name` is the npm package name and MUST equal build.mjs CLIENT_LOADER_ID:
+# the boot graph advertises the client bundle under that loader entry name.
+# `id` is the plugin's fiber id (short, unscoped); `name` is quoted because a
+# leading `@` is a reserved YAML character.
 - insert:
     - id: provider-hub
-      name: dsh-provider-hub
+      name: '@tappat225/dsh-provider-hub'

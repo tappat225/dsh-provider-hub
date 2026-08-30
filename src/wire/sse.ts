@@ -42,9 +42,9 @@ export async function* iterateSse(response: Response, signal?: AbortSignal): Asy
 }
 
 /** Terminal error finish chunk carrying a readable message. */
-export function errorFinish(message: string): StreamChunk {
+export function errorFinish(message: string, code = 'UPSTREAM_ERROR'): StreamChunk {
   return {
     type: 'finish',
-    reason: { kind: 'error', failure: { code: 'UPSTREAM_ERROR', message } },
+    reason: { kind: 'error', failure: { code, message } },
   };
 }

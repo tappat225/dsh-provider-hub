@@ -1,7 +1,8 @@
 // Verify the client bundle (lib/client.js) conforms to DSH's client module
 // system contract:
 //   1. the bundle registers itself via window.__ModuleLoader__.load;
-//   2. the registration id equals the loader entry name (dsh-provider-hub);
+//   2. the registration id equals the loader entry name
+//      (@tappat225/dsh-provider-hub = the package name);
 //   3. the factory resolves `react` through the module system's require and
 //      returns { apply, inject, name };
 //   4. apply() never throws on an empty/degraded ctx;
@@ -46,7 +47,7 @@ check('bundle registered exactly once', registrations.length === 1, `got ${regis
 if (registrations.length !== 1) process.exit(failures > 0 ? 1 : 0);
 
 const registration = registrations[0];
-check('registration id = dsh-provider-hub (loader entry name)', registration.id === 'dsh-provider-hub', `got ${registration.id}`);
+check('registration id = @tappat225/dsh-provider-hub (loader entry name)', registration.id === '@tappat225/dsh-provider-hub', `got ${registration.id}`);
 check('factory is a function', typeof registration.factory === 'function');
 
 // Materialize: the module system's require answers seed words only.
@@ -118,7 +119,7 @@ if (exports !== undefined) {
   await new Promise((resolve) => setTimeout(resolve, 20));
   check('apply() mounted the providerHub contribution', mounts.length === 1, `got ${mounts.length}`);
   if (mounts.length === 1) {
-    check('contribution package = dsh-provider-hub', mounts[0].package === 'dsh-provider-hub');
+    check('contribution package = @tappat225/dsh-provider-hub', mounts[0].package === '@tappat225/dsh-provider-hub');
     check('contribution carries providerHub descriptors', Array.isArray(mounts[0].descriptors) && mounts[0].descriptors.length > 0 && mounts[0].descriptors.every((d) => d.namespace === 'providerHub'), `descriptors=${mounts[0].descriptors?.length}`);
     check('descriptor for addGateway present', mounts[0].descriptors.some((d) => d.method === 'addGateway'));
     check('descriptors are strict (result mode strict)', mounts[0].descriptors.every((d) => d.result?.mode === 'strict' && d.invocation?.kind === 'direct'));

@@ -17,7 +17,10 @@ const host = await build({
   logLevel: 'info',
 });
 
-const CLIENT_LOADER_ID = 'dsh-provider-hub';
+// The loader entry name MUST equal the npm package name (cordis.patch.yml
+// `name`): the boot graph advertises the client bundle under
+// /plugins/<name>/client.js. Kept in sync by test/plugin.test.mjs.
+const CLIENT_LOADER_ID = '@tappat225/dsh-provider-hub';
 
 const client = await build({
   // DSH's client module system (@deepseek-ai/dsh-client-modules) requires

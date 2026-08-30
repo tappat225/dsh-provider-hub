@@ -120,7 +120,7 @@ export const INVOCATIONS = [
 
 /** Host manifest registered through `ctx.typert.register`. */
 export const TYPERT_MANIFEST = {
-  package: 'dsh-provider-hub',
+  package: '@tappat225/dsh-provider-hub',
   face: 'host',
   schemas: [],
   model: {

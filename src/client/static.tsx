@@ -171,7 +171,7 @@ export function apply(ctx: any): void {
         ctx.effect(() => {
           let cancelled = false;
           let unmount: (() => Promise<void>) | undefined;
-          const contribution = { package: 'dsh-provider-hub', descriptors: INVOCATIONS };
+          const contribution = { package: '@tappat225/dsh-provider-hub', descriptors: INVOCATIONS };
           void (remoteService as { $mount(c: unknown): Promise<() => Promise<void>> }).$mount(contribution).then((dispose) => {
             if (cancelled) {
               void dispose();

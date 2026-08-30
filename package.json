@@ -1,5 +1,5 @@
 {
-  "name": "dsh-provider-hub",
+  "name": "@tappat225/dsh-provider-hub",
   "version": "0.5.0",
   "description": "DSH LLM provider hub: register gateway routes with their own settings panel, a built-in mainstream model catalog, custom User-Agent for UA-whitelisted gateways, field-level model overrides, and live model discovery. Configure in the plugin panel — no hand-editing settings.yaml.",
   "type": "module",
@@ -47,6 +47,10 @@
     "gateway"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tappat225/dsh-provider-hub.git"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-llm": "^0.1.0-rc",

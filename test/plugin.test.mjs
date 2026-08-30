@@ -2,6 +2,7 @@
 // stream conversion (anthropic + openai paths), model discovery, multi-gateway
 // isolation, and a live probe through the UA gate.
 import http from 'node:http';
+import { readFileSync } from 'node:fs';
 import { BlockAssembler, LlmError } from '@deepseek-ai/dsh-llm';
 import * as plugin from '../lib/index.js';
 
@@ -17,6 +18,16 @@ check('apply', typeof plugin.apply === 'function');
 check('Config', !!plugin.Config);
 check('MODEL_CATALOG has glm-5.3', plugin.MODEL_CATALOG['glm-5.3']?.contextWindow > 0);
 check('NS', plugin.NS === 'llm-provider-hub');
+
+// 1c. Scoped package identity: package.json name == cordis.patch.yml `name` ==
+// build.mjs CLIENT_LOADER_ID == dsh.plugin.json id (the boot graph advertises
+// the client bundle under that loader entry name; a mismatch breaks web boot
+// into recovery mode). The cordis fiber id stays the short 'provider-hub'.
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+check('scoped package name @tappat225/dsh-provider-hub', pkg.name === '@tappat225/dsh-provider-hub');
+check('cordis patch name = package name (quoted, YAML @ reserved)', readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8').includes(`name: '${pkg.name}'`));
+check('client loader id = package name', readFileSync(new URL('../build.mjs', import.meta.url), 'utf8').includes(`CLIENT_LOADER_ID = '${pkg.name}'`));
+check('dsh.plugin.json id = package name', JSON.parse(readFileSync(new URL('../dsh.plugin.json', import.meta.url), 'utf8')).id === pkg.name);
 
 // 1b. Endpoint URL joining: both baseURL spellings (bare host and explicit
 // /v1 root) must resolve to the same endpoint set — the historical bug was
@@ -143,10 +154,14 @@ const sseEvents = [
   { type: 'message_stop' },
 ];
 let lastSeenHeaders = null;
+let lastBody = '';
+let requestCount = 0;
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
+    requestCount += 1;
+    lastBody = body;
     lastSeenHeaders = { url: req.url, ua: req.headers['user-agent'], key: req.headers['x-api-key'] ?? req.headers['authorization']?.slice(0, 12), body: body.slice(0, 120) };
     if (req.url.endsWith('/models')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -284,6 +299,97 @@ check('openai tools: wire tools param', (lastSeenHeaders?.body ?? '').includes('
 
 // 6d. custom model with empty params defaults (kept for catalog coverage)
 // (presetFrom was removed by design — no cross-provider import feature.)
+
+// 6e. reasoning-effort dispatch: the map's VALUE is the wire spelling
+// (llm-pi-ai semantics: key = selector level, value = wire value; valueless
+// off sends nothing; off with a value sends it; undeclared levels are
+// refused BEFORE network I/O).
+const effConfig = plugin.Config({ gateways: [{
+  provider: 'eff-gw',
+  baseURL: 'http://127.0.0.1:18996',
+  api: 'openai-completions',
+  userAgent: 'ua-eff',
+  apiKey: 'sk-eff',
+  enabledModels: [],
+  customModels: [
+    { id: 'dialect-model', name: 'Dialect', contextWindow: 64000, maxTokens: 4096, reasoningEfforts: { off: null, high: 'ultra' } },
+    { id: 'offval-model', name: 'OffVal', contextWindow: 64000, maxTokens: 4096, reasoningEfforts: { off: 'none', high: 'high' } },
+    { id: 'plain-model', name: 'Plain', contextWindow: 64000, maxTokens: 4096 },
+  ],
+}] }).gateways[0];
+const effAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [effConfig] }),
+  gatewayFor: (p) => effConfig.provider === p ? effConfig : undefined,
+  resolveApiKey: async () => 'sk-eff',
+});
+const effResolved = await effAdapter.resolveModel('eff-gw', 'dialect-model');
+check('effort metadata: map keys offered with capitalized names', JSON.stringify(effResolved.reasoning?.efforts) === JSON.stringify([{ id: 'off', name: 'Off' }, { id: 'high', name: 'High' }]) && effResolved.reasoning?.defaultEffort === undefined, JSON.stringify(effResolved.reasoning));
+const plainResolved = await effAdapter.resolveModel('eff-gw', 'plain-model');
+check('effort metadata: map-less model exposes no reasoning', plainResolved.reasoning === undefined, JSON.stringify(plainResolved.reasoning));
+const effStream = (model, effort) => effAdapter.stream({ provider: 'eff-gw', model, maxTokens: 8, ...(effort === undefined ? {} : { reasoningEffort: effort }), messages: [{ role: 'user', content: 'hi' }] });
+for await (const _c of effStream('dialect-model', 'high')) { /* drain */ }
+check('effort wire: declared spelling "ultra" sent for high', lastBody.includes('"reasoning_effort":"ultra"'), lastBody.slice(0, 200));
+for await (const _c of effStream('dialect-model', 'off')) { /* drain */ }
+check('effort wire: valueless off omits the parameter', !lastBody.includes('reasoning_effort'), lastBody.slice(0, 200));
+for await (const _c of effStream('dialect-model', undefined)) { /* drain */ }
+check('effort wire: no effort selected omits the parameter', !lastBody.includes('reasoning_effort'), lastBody.slice(0, 200));
+for await (const _c of effStream('offval-model', 'off')) { /* drain */ }
+check('effort wire: off with declared value sends "none"', lastBody.includes('"reasoning_effort":"none"'), lastBody.slice(0, 200));
+const beforeUnsupported = requestCount;
+const unsupportedChunks = [];
+for await (const c of effStream('dialect-model', 'max')) unsupportedChunks.push(c);
+const unsupportedFinish = unsupportedChunks.at(-1);
+check('effort unsupported: refused before network I/O', unsupportedFinish?.reason?.kind === 'error'
+  && unsupportedFinish?.reason?.failure?.code === 'UNSUPPORTED_REASONING_EFFORT'
+  && /does not support reasoning effort "max"/.test(unsupportedFinish?.reason?.failure?.message ?? '')
+  && requestCount === beforeUnsupported, JSON.stringify(unsupportedFinish?.reason));
+const plainChunks = [];
+for await (const c of effStream('plain-model', 'high')) plainChunks.push(c);
+check('effort on non-reasoning model refused', plainChunks.at(-1)?.reason?.kind === 'error' && /does not support reasoning effort/.test(plainChunks.at(-1)?.reason?.failure?.message ?? ''), JSON.stringify(plainChunks.at(-1)?.reason));
+const ghostChunks = [];
+for await (const c of effStream('ghost-model', undefined)) ghostChunks.push(c);
+check('stream: non-enabled model refused (UNKNOWN_MODEL)', ghostChunks.at(-1)?.reason?.kind === 'error' && ghostChunks.at(-1)?.reason?.failure?.code === 'UNKNOWN_MODEL', JSON.stringify(ghostChunks.at(-1)?.reason));
+
+// 6f. anthropic thinking passthrough: level -> budget_tokens, max_tokens guard
+const thinkConfig = plugin.Config({ gateways: [{
+  provider: 'think-gw',
+  baseURL: 'http://127.0.0.1:18996',
+  api: 'anthropic-messages',
+  userAgent: 'ua-think',
+  apiKey: 'sk-think',
+  anthropicThinking: true,
+  enabledModels: ['glm-5.3'],
+  customModels: [{ id: 'turbo-model', name: 'Turbo', contextWindow: 64000, maxTokens: 4096, reasoningEfforts: { off: null, turbo: 'turbo' } }],
+}] }).gateways[0];
+const thinkAdapter = new (Object.getPrototypeOf(adapter).constructor)({
+  current: () => ({ gateways: [thinkConfig] }),
+  gatewayFor: (p) => thinkConfig.provider === p ? thinkConfig : undefined,
+  resolveApiKey: async () => 'sk-think',
+});
+for await (const _c of thinkAdapter.stream({ provider: 'think-gw', model: 'glm-5.3', maxTokens: 32, reasoningEffort: 'high', messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
+check('anthropic thinking: high -> budget 8192, max_tokens lifted to budget+1024', lastBody.includes('"thinking":{"type":"enabled","budget_tokens":8192}') && lastBody.includes('"max_tokens":9216'), lastBody.slice(0, 200));
+for await (const _c of thinkAdapter.stream({ provider: 'think-gw', model: 'glm-5.3', maxTokens: 32, reasoningEffort: 'off', messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
+check('anthropic thinking: off sends no thinking field', !lastBody.includes('"thinking"'), lastBody.slice(0, 200));
+const beforeTurbo = requestCount;
+const turboChunks = [];
+for await (const c of thinkAdapter.stream({ provider: 'think-gw', model: 'turbo-model', maxTokens: 32, reasoningEffort: 'turbo', messages: [{ role: 'user', content: 'hi' }] })) turboChunks.push(c);
+check('anthropic thinking: unmapped level refused before network I/O', turboChunks.at(-1)?.reason?.kind === 'error'
+  && /no budget mapped/.test(turboChunks.at(-1)?.reason?.failure?.message ?? '')
+  && requestCount === beforeTurbo, JSON.stringify(turboChunks.at(-1)?.reason));
+
+// 6g. reasoning map validation (fail-loud at resolution, reference semantics)
+const mapConfigOf = (efforts) => plugin.Config({ gateways: [{ ...effConfig, customModels: [{ id: 'bad-model', name: 'Bad', contextWindow: 64000, maxTokens: 4096, reasoningEfforts: efforts }] }] }).gateways[0];
+let threwNonOffNull = false;
+try { plugin.resolveModelEntries(mapConfigOf({ off: null, low: null })); } catch (e) { threwNonOffNull = /reasoningEfforts\.low needs the wire value/.test(e.message); }
+check('map validation: non-off null refused', threwNonOffNull);
+let threwOnlyOff = false;
+try { plugin.resolveModelEntries(mapConfigOf({ off: null })); } catch (e) { threwOnlyOff = /offers no level beyond "off"/.test(e.message); }
+check('map validation: only-off map refused', threwOnlyOff);
+let threwEmpty = false;
+try { plugin.resolveModelEntries(mapConfigOf({ high: '' })); } catch (e) { threwEmpty = /must not be an empty string/.test(e.message); }
+check('map validation: empty wire value refused', threwEmpty);
+const gpt4oResolved = await adapter.resolveModel('gw-b', 'gpt-4o');
+check('non-reasoning builtin: no reasoning advertised (no lone-off control)', gpt4oResolved.reasoning === undefined, JSON.stringify(gpt4oResolved.reasoning));
 
 // 9. ProviderHubRuntime (client-half remote service) with fake settings/llm — gateway-indexed
 const { ProviderHubRuntime } = await import('../src/host/runtime.ts');
