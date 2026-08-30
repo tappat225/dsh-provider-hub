@@ -7,8 +7,8 @@
  *
  * `reasoning` maps offered effort ids to their wire spellings: the KEY is the
  * level the DSH selector offers, the VALUE is what the adapter dispatches on
- * the wire (`reasoning_effort` on the openai-completions path; the level
- * drives the thinking budget on the anthropic path). A valueless `off` means
+ * the wire (`reasoning_effort` on the OpenAI paths; the adapter's built-in
+ * Anthropic thinking-budget table on the Anthropic path). A valueless `off` means
  * "thinking disabled, send nothing" (the parameter's absence); an `off` with
  * a value is that value's explicit spelling. Values follow the model
  * families' public specs; the Models page "discover" button can refresh real

@@ -329,7 +329,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         apiKey: entry.gateway.apiKey,
         apiKeyEnv: entry.gateway.apiKeyEnv,
         systemRole: entry.gateway.systemRole,
-        anthropicThinking: Boolean(entry.gateway.anthropicThinking),
       };
       try {
         patch.extraHeaders = JSON.parse(headersText[selected] || '{}') as Record<string, unknown>;
@@ -390,7 +389,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       userAgent: cfg.userAgent,
       apiKey: cfg.apiKey,
       apiKeyEnv: cfg.apiKeyEnv,
-      anthropicThinking: Boolean(cfg.anthropicThinking),
       extraHeaders: {},
     };
     const raw = (headersText[selected] ?? '').trim();
@@ -822,13 +820,6 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
           ),
         }),
         fieldRow('apiKeyEnv', t('apiKeyEnv'), t('apiKeyHint')),
-        Row({
-          title: t('anthropicThinking'),
-          control: SwitchUI({
-            checked: Boolean(cfg.anthropicThinking),
-            onChange: (next) => setField('anthropicThinking', next),
-          }),
-        }),
         // JSON editors get the full card width: a narrow right-hand box
         // makes JSON unreadable.
         React.createElement('div', { className: 'phub-stack' },

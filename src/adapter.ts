@@ -269,7 +269,7 @@ export class GatewayAdapter extends LlmAdapter {
     yield* this.streamAnthropic(options, gw, headers, apiKey, thinkingLevel);
   }
 
-  /** Anthropic thinking budget (tokens) per selector level — the built-in fallback table. */
+  /** Anthropic's built-in thinking budget table, matching pi-ai defaults. */
   private static readonly ANTHROPIC_THINKING_BUDGET: Record<string, number> = {
     minimal: 512,
     low: 1024,
@@ -278,24 +278,6 @@ export class GatewayAdapter extends LlmAdapter {
     xhigh: 16384,
     max: 24576,
   };
-
-  /**
-   * The effective thinking-budget table for one gateway: the gateway's
-   * `anthropicThinkingBudgets` dict overrides the built-in per-level table
-   * level by level (which is how a custom effort level like `turbo` becomes
-   * mappable); invalid entries are ignored and an unset/empty field leaves
-   * the built-in table in place.
-   */
-  private anthropicThinkingBudgets(gw: GatewayConfig): Record<string, number> {
-    const merged: Record<string, number> = { ...GatewayAdapter.ANTHROPIC_THINKING_BUDGET };
-    const custom = gw.anthropicThinkingBudgets;
-    if (custom !== null && typeof custom === 'object' && !Array.isArray(custom)) {
-      for (const [level, tokens] of Object.entries(custom)) {
-        if (typeof tokens === 'number' && Number.isInteger(tokens) && tokens > 0) merged[level] = tokens;
-      }
-    }
-    return merged;
-  }
 
   /**
    * Per-request output cap when the caller (DSH) sends none: the gateway's
@@ -320,20 +302,16 @@ export class GatewayAdapter extends LlmAdapter {
     apiKey: string,
     thinkingLevel: string | undefined,
   ): AsyncGenerator<StreamChunk> {
-    // When anthropicThinking is enabled, the validated effort level maps to
-    // Anthropic thinking through the budget table (gateway
-    // anthropicThinkingBudgets overrides the built-in table level by level).
-    // Anthropic requires max_tokens > budget_tokens; adjust upward when
-    // needed. An effort whose level has no budget mapping is refused before
-    // the request instead of silently taking a fallback budget.
-    const budgets = this.anthropicThinkingBudgets(gw);
+    // Anthropic's native path automatically treats every selected non-off
+    // reasoning level as enabled thinking; the adapter owns the canonical
+    // level-to-budget mapping, so there is no per-gateway configuration.
+    const budgets = GatewayAdapter.ANTHROPIC_THINKING_BUDGET;
     let thinking: { type: 'enabled'; budget_tokens: number } | undefined;
-    if (gw.anthropicThinking && thinkingLevel !== undefined) {
+    if (thinkingLevel !== undefined) {
       const budget = budgets[thinkingLevel];
       if (budget === undefined) {
         yield errorFinish(
-          `llm-provider-hub: model "${options.model}" declares effort "${thinkingLevel}", but the anthropicThinking passthrough has no budget mapped for it`
-            + ` (mapped levels: ${Object.keys(budgets).join(', ')}); map the level in anthropicThinkingBudgets or disable anthropicThinking`,
+          `llm-provider-hub: model "${options.model}" declares effort "${thinkingLevel}", but Anthropic thinking has no built-in budget for it`,
           'UNSUPPORTED_REASONING_EFFORT',
         );
         return;

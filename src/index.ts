@@ -84,16 +84,12 @@ const GatewaySchema = z.object({
   systemRole: z.union(['system', 'developer']).default('system'),
   /** Request the final usage chunk on the openai-completions path (stream_options.include_usage; disable for gateways that reject the parameter). */
   streamUsage: z.boolean().default(true),
-  /** When true, the anthropic-messages path forwards reasoningEffort as Anthropic `thinking` (budget_tokens by effort). */
-  anthropicThinking: z.boolean().default(false),
   /** Default context window for custom models that omit contextWindow (optional: unset means no gateway fallback). */
   defaultContextWindow: z.number().step(1).min(1),
   /** Default per-request output cap (fills custom entries without maxTokens and requests DSH sends without one; unset keeps the 4096 floor). */
   defaultMaxTokens: z.number().step(1).min(1),
   /** Default input modalities for custom models that omit input. */
   defaultInput: z.array(z.union(['text', 'image', 'audio'])),
-  /** Anthropic thinking budget (tokens) per reasoning level; unset levels fall back to the adapter's built-in table. */
-  anthropicThinkingBudgets: z.dict(z.number().step(1).min(1)),
   /** Field-level parameter overrides for built-in catalog models (id -> partial entry). */
   modelOverrides: z.dict(z.object({
     name: z.string(),

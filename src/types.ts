@@ -91,8 +91,6 @@ export interface GatewayConfig {
    * field existed).
    */
   streamUsage?: boolean;
-  /** When true, the anthropic-messages path forwards reasoningEffort as Anthropic `thinking`. */
-  anthropicThinking: boolean;
   /**
    * Default context window for custom model entries that omit `contextWindow`.
    * Optional: absent means no gateway fallback (a custom entry must then carry
@@ -108,12 +106,6 @@ export interface GatewayConfig {
   defaultMaxTokens?: number;
   /** Default input modalities for custom entries that omit `input` (legacy fallback: text). */
   defaultInput?: ModelModality[];
-  /**
-   * Anthropic thinking budget (tokens) per reasoning level, overriding the
-   * adapter's built-in per-level table. Unset levels — and an unset field —
-   * fall back to the built-in table.
-   */
-  anthropicThinkingBudgets?: Record<string, number>;
   /** Built-in catalog model ids to enable in the picker. */
   enabledModels: string[];
   /** Field-level parameter overrides for built-in catalog models (id -> partial entry). */

@@ -295,7 +295,6 @@ export class ProviderHubRuntime extends TypertRemoteService {
         extraHeaders: {},
         systemRole: 'system',
         streamUsage: true,
-        anthropicThinking: false,
         enabledModels: ['glm-5.3'],
         modelOverrides: {},
         customModels: [],
@@ -420,15 +419,6 @@ export class ProviderHubRuntime extends TypertRemoteService {
           if (modality !== 'text' && modality !== 'image' && modality !== 'audio') {
             return fail('defaultInput must contain only "text", "image" or "audio"');
           }
-        }
-      }
-      if (patch.anthropicThinkingBudgets !== undefined && patch.anthropicThinkingBudgets !== null) {
-        const budgets = patch.anthropicThinkingBudgets;
-        if (budgets === null || typeof budgets !== 'object' || Array.isArray(budgets)) {
-          return fail('anthropicThinkingBudgets must be a JSON object of level -> token budget');
-        }
-        for (const [level, tokens] of Object.entries(budgets)) {
-          if (!positiveInt(tokens)) return fail(`anthropicThinkingBudgets.${level} must be a positive integer`);
         }
       }
       // API keys are write-only: store a newly entered key in credentials and
@@ -768,7 +758,6 @@ export class ProviderHubRuntime extends TypertRemoteService {
         userAgent: str(draft.userAgent, saved.userAgent),
         apiKey: str(draft.apiKey, saved.apiKey),
         apiKeyEnv: str(draft.apiKeyEnv, saved.apiKeyEnv),
-        anthropicThinking: typeof draft.anthropicThinking === 'boolean' ? draft.anthropicThinking : saved.anthropicThinking,
         extraHeaders: headers as Record<string, string>,
       };
       // str() guarantees a string, but the GatewayConfig annotation widens the

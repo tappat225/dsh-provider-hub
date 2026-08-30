@@ -102,8 +102,7 @@ npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其
 | `apiKeyEnv` | `GATEWAY_API_KEY` | credential-ref 环境变量名 |
 | `apiKey` | 空 | 字面量 key，优先于 apiKeyEnv（设置页默认掩码显示，可切换明文） |
 | `extraHeaders` | `{}` | 附加请求头 |
-| `systemRole` | `system` | openai 路径系统提示词角色；`developer` 可修复只认 developer 角色的严格网关（GPT 系） |
-| `anthropicThinking` | `false` | anthropic 路径是否把选中的思考档位透传为 `thinking: {type:'enabled', budget_tokens: N}`（档位→预算：minimal 512 / low 1024 / medium 4096 / high 8192 / xhigh 16384 / max 24576；`max_tokens` 自动抬高到 `budget+1024` 以上；未映射档位在请求前拒绝） |
+| `systemRole` | `system` | OpenAI 路径系统提示词角色；`developer` 可修复只认 developer 角色的严格网关（GPT 系） |
 | `enabledModels` | `["glm-5.3"]` | 从内置目录勾选 |
 | `modelOverrides` | `{}` | 按模型 id 对内置目录做字段级参数覆盖（contextWindow/maxTokens/input/reasoningEfforts/name） |
 | `customModels` | `[]` | 自定义模型（id/name/contextWindow/maxTokens/input/reasoningEfforts；映射语义见下方「思考强度派发」） |
@@ -121,7 +120,7 @@ GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5
 - 未声明的档位（以及无映射模型收到任何档位）在**发请求前**以 `UNSUPPORTED_REASONING_EFFORT` 拒绝，不透传给网关。
 - 仅含 `off` 的映射会被解析拒绝——非推理模型不要声明映射（内置 GPT-4o / GPT-4o mini / DeepSeek V3 已无映射）；`reasoningEfforts: {}` 与缺省等价（无推理能力）。
 - 校验在模型解析期进行（fail-loud）：非 off 空值 / 空字符串 / 仅含 off 的映射都以带网关+模型+档位名的诊断拒绝。
-- anthropic 路径：开启 `anthropicThinking` 后按档位映射 `thinking` 预算（预算表见配置表）；`off` 不发送 thinking；未映射档位在请求前拒绝。
+- Anthropic 路径：选中非 `off` 档位时，适配器自动按原生 Anthropic `thinking` 预算派发；`off` 不发送 `thinking`。
 - `modelOverrides` 的 `reasoningEfforts` 整体替换内置映射（字典无删除语义；留空 `{}` 视为未设置，保留内置映射）。
 - 设置页暂无该映射的编辑入口，需在 settings.yaml 中手改。
 
@@ -132,7 +131,7 @@ GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5
 
 ## 限制
 
-- `anthropic-messages` 路径默认不透传思考档位；开启 `anthropicThinking` 后按档位映射为 `thinking`（网关兼容层行为不一，默认关闭更安全）。
+- `anthropic-messages` 路径会根据模型选择的 reasoning 档位自动处理原生 `thinking`；无需单独配置开关。
 - `openai-completions` 路径按 `reasoningEfforts` 映射派发 `reasoning_effort`（语义见「思考强度派发」；未声明档位请求前拒绝，不做网关侧猜测）。
 - 模型发现拉取的 `/models` 若网关也做 UA 校验，插件已带自定义 UA，可正常访问。
 - 网关路由名改动实时生效（保存时立即重新注册路由）；多网关路由名不能重复（设置页会自动生成去重名，重名保存被拒绝）。

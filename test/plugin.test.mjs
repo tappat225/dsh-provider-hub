@@ -53,6 +53,7 @@ const config = plugin.Config({
   }],
 });
 check('Config defaults', config.gateways[0].provider === 'air-outer' && config.gateways[0].userAgent === 'claude-cli/2.0.1 (external, cli)');
+check('Anthropic thinking is adapter-owned', config.gateways[0].anthropicThinking === undefined && config.gateways[0].anthropicThinkingBudgets === undefined);
 check('Config customModels kept', config.gateways[0].customModels.length === 1);
 const defaultModelConfig = plugin.Config({ gateways: [{
   provider: 'defaults-gw',
@@ -422,7 +423,6 @@ const thinkConfig = plugin.Config({ gateways: [{
   api: 'anthropic-messages',
   userAgent: 'ua-think',
   apiKey: 'sk-think',
-  anthropicThinking: true,
   enabledModels: ['glm-5.3'],
   customModels: [{ id: 'turbo-model', name: 'Turbo', contextWindow: 64000, maxTokens: 4096, reasoningEfforts: { off: null, turbo: 'turbo' } }],
 }] }).gateways[0];
@@ -439,7 +439,7 @@ const beforeTurbo = requestCount;
 const turboChunks = [];
 for await (const c of thinkAdapter.stream({ provider: 'think-gw', model: 'turbo-model', maxTokens: 32, reasoningEffort: 'turbo', messages: [{ role: 'user', content: 'hi' }] })) turboChunks.push(c);
 check('anthropic thinking: unmapped level refused before network I/O', turboChunks.at(-1)?.reason?.kind === 'error'
-  && /no budget mapped/.test(turboChunks.at(-1)?.reason?.failure?.message ?? '')
+  && /no built-in budget/.test(turboChunks.at(-1)?.reason?.failure?.message ?? '')
   && requestCount === beforeTurbo, JSON.stringify(turboChunks.at(-1)?.reason));
 
 // 6g. reasoning map validation (fail-loud at resolution, reference semantics)
@@ -570,7 +570,7 @@ check('runtime saveOverrides', ro.ok === true && stored.gateways[0].modelOverrid
 // captures the binding VALUE (the composition entry) instead of a thunk, the
 // settings page reads the entry forever ("saved but list empty") even though
 // settings.yaml holds the section and writes commit fine.
-const rebindDoc = { gateways: [{ provider: 'hub-gateway', displayName: 'hub-gateway', baseURL: '', api: 'anthropic-messages', userAgent: 'claude-cli/2.0.1 (external, cli)', apiKeyEnv: 'GATEWAY_API_KEY', apiKey: '', extraHeaders: {}, systemRole: 'system', anthropicThinking: false, enabledModels: ['glm-5.3'], modelOverrides: {}, customModels: [] }] };
+const rebindDoc = { gateways: [{ provider: 'hub-gateway', displayName: 'hub-gateway', baseURL: '', api: 'anthropic-messages', userAgent: 'claude-cli/2.0.1 (external, cli)', apiKeyEnv: 'GATEWAY_API_KEY', apiKey: '', extraHeaders: {}, systemRole: 'system', enabledModels: ['glm-5.3'], modelOverrides: {}, customModels: [] }] };
 const cloneJson = (v) => JSON.parse(JSON.stringify(v));
 let rebindRevision = 0;
 let rebindWatcher = null;
