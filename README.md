@@ -87,7 +87,7 @@ npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其
 
    在 `~/.dsh/profiles/desktop` 下 `pnpm install`，重启 DSH Desktop。
 
-2. 打开左侧栏设置按钮上方的 **Provider Hub** 面板：hero 卡的“添加提供方”（或网格末尾的虚线卡）新建提供方，点卡片上的“编辑”展开配置页。配置页为 cc-switch 风格：基础字段（Base URL / 协议 / 端点模式 / User-Agent / API Key / Key 环境变量）→ **请求头** 键值行（添加请求头 / 行内删除）→ **模型配置** 简表（每行 模型 ID + 显示名称；“拉取模型列表”从上游 `/models` 拉取后点选即加入列表，“添加模型”手动加行）→ **配置 JSON** 详细参数页 → 页尾唯一的 **保存**。
+2. 打开左侧栏设置按钮上方的 **Provider Hub** 面板：hero 卡的“添加提供方”（或网格末尾的虚线卡）新建提供方，点卡片上的“编辑”展开配置页。配置页为 cc-switch 风格：基础字段（提供方 ID / 显示名 / Base URL / 协议 / 端点模式 / User-Agent / API Key / Key 环境变量；**显示名默认跟随提供方 ID**，自己填写显示名后才以填写值为准，清空则回落提供方 ID）→ **请求头** 键值行（添加请求头 / 行内删除）→ **模型配置** 简表（每行 模型 ID + 显示名称；“拉取模型列表”从上游 `/models` 拉取后点选即加入列表，“添加模型”手动加行）→ **配置 JSON** 详细参数页 → 页尾唯一的 **保存**。
    **模型 ID 联想（点选才套用）**：在模型 ID 输入框打字，从**第一个字符**起出现内置目录联想下拉（前缀匹配优先、包含匹配次之，同时匹配显示名；↑↓ 高亮、Enter 选中、Esc 关闭）。**只有点选下拉条目（或 ↑↓+Enter）才写入完整的目录参数**（contextWindow / maxTokens / input / reasoningEfforts 显式展开，可直接修改）——哪怕手动输完整个目录模型名，也不会自动填参，仅预留全字段参数框架。
    **配置 JSON = 常驻完整参数框架 + 独立编辑面**：每个模型组始终保留完整字段框架 `name` / `contextWindow` / `maxTokens` / `input` / `reasoningEfforts`，`null` = 未设置（内置模型保存时继承目录值；自定义模型需填 contextWindow 与 maxTokens，除非网关配置了 `defaultContextWindow` / `defaultMaxTokens`）。列表与 JSON **双向同步**：列表增删改行会迁移 JSON 组；在 JSON 中**手写新组即新增模型**（组内 `name` 即显示名）、**删除组即删除模型**——完全可以不碰模型列表，直接在 JSON 里逐项填参。JSON 文本无效时锁定列表编辑（不覆盖正在编辑的文本），修正后自动解锁。一次保存同时提交基础字段（save-config）与整份模型列表+参数（save-models，写前经模型解析校验）。
 
@@ -102,7 +102,7 @@ npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `provider` | `hub-gateway`（自动去重为 hub-gateway-1…） | 提供方 ID（跨网关唯一，改名实时生效、无需重启；重名或空名在保存时拒绝。前缀 `hub-` 标识本插件，避免与其他 provider 插件路由名冲突） |
-| `displayName` | `Gateway` | 选择器显示名 |
+| `displayName` | `提供方 ID`（空/未填回落提供方 ID） | 选择器显示名（默认使用提供方 ID；填写后以填写值为准） |
 | `baseURL` | 空（必填） | 上游地址 |
 | `api` | `anthropic-messages` | 或 `openai-completions`（后者按模型 `reasoningEfforts` 映射派发 `reasoning_effort`，语义见「思考强度派发」） |
 | `userAgent` | `claude-cli/2.0.1 (external, cli)` | wire UA（可完全自定义，每网关独立；留空自动回退默认值，面板内置常见客户端 UA 预设一键填写） |

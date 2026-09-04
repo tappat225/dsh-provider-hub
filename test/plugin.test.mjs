@@ -53,6 +53,7 @@ const config = plugin.Config({
   }],
 });
 check('Config defaults', config.gateways[0].provider === 'air-outer' && config.gateways[0].userAgent === 'claude-cli/2.0.1 (external, cli)');
+check('Config displayName defaults to empty (resolves to provider id)', config.gateways[0].displayName === '', JSON.stringify(config.gateways[0].displayName));
 check('Anthropic thinking is adapter-owned', config.gateways[0].anthropicThinking === undefined && config.gateways[0].anthropicThinkingBudgets === undefined);
 check('Config customModels kept', config.gateways[0].customModels.length === 1);
 const defaultModelConfig = plugin.Config({ gateways: [{
@@ -698,6 +699,19 @@ const renameCollide = await rebindRuntime.saveConfig(1, { provider: 'hub-gateway
 check('rename: collision with another gateway refused', renameCollide.ok === false && /already used/.test(String(renameCollide.error)), String(renameCollide.error));
 const renameEmpty = await rebindRuntime.saveConfig(1, { provider: '  ' });
 check('rename: empty provider id refused', renameEmpty.ok === false && /must not be empty/.test(String(renameEmpty.error)), String(renameEmpty.error));
+// 9b-3. Display name DEFAULTS to the provider id: an empty/whitespace display
+// name is normalized to the provider id on save (clearing the field resets
+// it), a filled-in name is trimmed and kept, and the re-synced directory
+// shows the provider id when no display name was given.
+const dnBlank = await rebindRuntime.saveConfig(1, { displayName: '   ' });
+check('saveConfig: blank displayName defaults to the provider id', dnBlank.ok === true && rebindDoc.gateways[1].displayName === 'trimmed-gw', JSON.stringify(rebindDoc.gateways[1].displayName));
+check('saveConfig: blank displayName re-syncs directory with the provider id', rebindLlmCalls.directory.some((e) => e.provider === 'trimmed-gw' && e.displayName === 'trimmed-gw'), JSON.stringify(rebindLlmCalls.directory));
+const dnCustom = await rebindRuntime.saveConfig(1, { displayName: '  Custom GW  ' });
+check('saveConfig: custom displayName trimmed and kept', dnCustom.ok === true && rebindDoc.gateways[1].displayName === 'Custom GW', JSON.stringify(rebindDoc.gateways[1].displayName));
+const dnBad = await rebindRuntime.saveConfig(1, { displayName: 42 });
+check('saveConfig: non-string displayName refused', dnBad.ok === false && /displayName must be a string/.test(String(dnBad.error)), String(dnBad.error));
+const dnKeep = await rebindRuntime.saveConfig(1, { displayName: 'trimmed-gw' });
+check('saveConfig: displayName equal to the provider id stored as-is', dnKeep.ok === true && rebindDoc.gateways[1].displayName === 'trimmed-gw', JSON.stringify(rebindDoc.gateways[1].displayName));
 
 // 9b-3. saveConfig wire-field validation: bad protocol values, URLs, and
 // header-injecting CR/LF values are refused at write time.

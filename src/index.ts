@@ -50,15 +50,16 @@ export const NS = settingsNamespace('llm-provider-hub');
 
 export const DEFAULT_API_KEY_ENV = 'GATEWAY_API_KEY';
 
-/** Default display name for a gateway entry. */
-export const DEFAULT_DISPLAY_NAME = 'Gateway';
-
 /** One gateway (provider route) schema — the unit of configuration. */
 const GatewaySchema = z.object({
   /** Provider route this gateway registers (unique across gateways; changes apply live). */
   provider: z.string(),
-  /** Display name in model pickers. */
-  displayName: z.string().default(DEFAULT_DISPLAY_NAME),
+  /**
+   * Display name in model pickers. DEFAULTS to the provider id: absent/empty
+   * (schema default) resolves to the provider id on every read side
+   * (directory registration, adapter providerInfo, panel cards/titles).
+   */
+  displayName: z.string().default(''),
   /** Upstream base URL (auto: API root; custom: the complete model-listing URL). */
   baseURL: z.string(),
   /** Wire protocol. */
@@ -189,7 +190,7 @@ export function apply(ctx: Context, config: WireConfig) {
     try {
       const entries: DirectoryEntry[] = gateways.map((gw) => ({
         provider: gw.provider,
-        displayName: gw.displayName || DEFAULT_DISPLAY_NAME,
+        displayName: gw.displayName || gw.provider,
         settingsNs: NS,
         settingsPath: [],
       }));

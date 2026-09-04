@@ -501,6 +501,25 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     setTestResult((tr) => (tr[selected] === undefined || tr[selected] === null ? tr : { ...tr, [selected]: null }));
   };
 
+  /**
+   * Provider-id edit: the display name DEFAULTS to the provider id. While the
+   * display name is still unset (empty) or still equals the previous provider
+   * id (never customized), it follows the id; a display name the user filled
+   * in is never overwritten by this sync. The host also normalizes an empty
+   * display name to the provider id on save, so clearing the field resets it.
+   */
+  const setProviderField = (value: string) => {
+    const selected = state.selected;
+    if (selected === null) return;
+    const entry = state.gateways.find((g) => g.index === selected);
+    if (entry === undefined) return;
+    const oldProvider = String(entry.gateway.provider ?? '');
+    const oldDisplay = String(entry.gateway.displayName ?? '');
+    const follows = oldDisplay === '' || oldDisplay === oldProvider;
+    setField('provider', value);
+    if (follows) setField('displayName', value);
+  };
+
   /** Clear the connection-test banner for the selected gateway. */
   const clearTestResult = () => {
     const selected = state.selected;
@@ -1070,7 +1089,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
 
   /** One provider card for the grid. */
   const gatewayCard = (g: GatewayEntry): ReactTypes.ReactElement => {
-    const name = String(g.gateway.displayName ?? g.gateway.provider ?? '');
+    const name = String(g.gateway.displayName || g.gateway.provider || '');
     const provider = String(g.gateway.provider ?? '');
     const api = String(g.gateway.api ?? '');
     const base = String(g.gateway.baseURL ?? '');
@@ -1116,13 +1135,16 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   };
 
   /** Editor field bound to one gateway config key. */
-  const fieldInput = (key: string, label: string, hint?: string, placeholder?: string, wide = false) => {
+  const fieldInput = (key: string, label: string, hint?: string, placeholder?: string, wide = false, onChange?: (value: string) => void) => {
     return Field(label, hint, React.createElement('input', {
       className: 'phub-input',
       value: String(cfg[key] ?? ''),
       placeholder,
       spellCheck: false,
-      onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => setField(key, e.target.value),
+      onChange: (e: ReactTypes.ChangeEvent<HTMLInputElement>) => {
+        if (onChange !== undefined) onChange(e.target.value);
+        else setField(key, e.target.value);
+      },
     }), wide);
   };
 
@@ -1273,7 +1295,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   const editorSection = selected === null || selectedEntry === undefined ? null : React.createElement(React.Fragment, null,
     React.createElement('div', { className: 'phub-sectionTitle' },
       React.createElement('div', null,
-        React.createElement('h3', null, `${t('gateway')} · ${String(cfg.displayName ?? cfg.provider ?? '')}`),
+        React.createElement('h3', null, `${t('gateway')} · ${String(cfg.displayName || cfg.provider || '')}`),
         React.createElement('div', { className: 'phub-sectionHelp' },
           `${String(cfg.api ?? 'anthropic-messages')} · ${String(cfg.endpointMode ?? 'auto') === 'custom' ? t('modeCustom') : t('modeAuto')}`),
       ),
@@ -1287,8 +1309,8 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     React.createElement('div', { className: 'phub-card phub-editorCard' },
       // ---- Basic fields ----
       React.createElement('div', { className: 'phub-form' },
-        fieldInput('provider', t('providerName'), t('providerNameHint')),
-        fieldInput('displayName', t('displayName')),
+        fieldInput('provider', t('providerName'), t('providerNameHint'), undefined, false, setProviderField),
+        fieldInput('displayName', t('displayName'), t('displayNameHint')),
         // baseURL meaning depends on the endpoint mode: auto = API root
         // (/v1 auto-completed), custom = the COMPLETE model-listing URL.
         fieldInput('baseURL', `${t('baseURL')} *`,

@@ -410,6 +410,17 @@ export class ProviderHubRuntime extends TypertRemoteService {
         }
         normalizedPatch = { ...patch, provider };
       }
+      // Display name DEFAULTS to the provider id: an empty/whitespace display
+      // name is normalized to the provider id (the id from this same patch
+      // when it renames, else the gateway's current id) — clearing the field
+      // resets it to the id; a filled-in name is trimmed and kept verbatim.
+      if (normalizedPatch.displayName !== undefined) {
+        if (typeof normalizedPatch.displayName !== 'string') return fail('displayName must be a string');
+        const displayName = normalizedPatch.displayName.trim();
+        const providerId = typeof normalizedPatch.provider === 'string' && normalizedPatch.provider !== ''
+          ? normalizedPatch.provider : gw.provider;
+        normalizedPatch = { ...normalizedPatch, displayName: displayName !== '' ? displayName : providerId };
+      }
       // Wire-critical field validation: refuse a bad protocol value, URL, UA,
       // or header at write time instead of failing at request time. Header
       // names/values carrying CR/LF would let a request inject upstream

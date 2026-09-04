@@ -200,6 +200,38 @@ check('editor card opens', byClass(root, 'phub-editorCard').length === 1);
 check('editor renders a two-column form grid', byClass(root, 'phub-form').length === 1);
 check('editor renders >= 8 labeled fields', byClass(root, 'phub-field').length >= 8, `got ${byClass(root, 'phub-field').length}`);
 
+// ---- Display name DEFAULTS to the provider id: it follows provider edits
+// until the user fills in a display name of their own ----
+const formInputs = () => {
+  const out = [];
+  walk(byClass(root, 'phub-form')[0], (n) => { if (n.type === 'input') out.push(n); });
+  return out;
+};
+let fi = formInputs();
+check('form: provider input first, display-name second', fi[0]?.props?.value === 'test' && fi[1]?.props?.value === 'Test GW', `${fi[0]?.props?.value} / ${fi[1]?.props?.value}`);
+// A display name the user filled in (≠ provider) survives a provider rename.
+fi[0].props.onChange({ target: { value: 'renamed-gw' } });
+root = render();
+fi = formInputs();
+check('customized display name preserved on provider rename', fi[0].props.value === 'renamed-gw' && fi[1].props.value === 'Test GW', `${fi[0].props.value} / ${fi[1].props.value}`);
+// Clearing the display name (unset = default) makes it follow the provider id.
+fi[1].props.onChange({ target: { value: '' } });
+root = render();
+fi = formInputs();
+fi[0].props.onChange({ target: { value: 'follow-gw' } });
+root = render();
+fi = formInputs();
+check('unset display name follows the provider id', fi[0].props.value === 'follow-gw' && fi[1].props.value === 'follow-gw', `${fi[0].props.value} / ${fi[1].props.value}`);
+// A display name still equal to the previous provider id (the default add
+// state) also follows renames.
+fi[1].props.onChange({ target: { value: 'follow-gw' } });
+root = render();
+fi = formInputs();
+fi[0].props.onChange({ target: { value: 'next-gw' } });
+root = render();
+fi = formInputs();
+check('display name equal to the previous provider id follows renames', fi[0].props.value === 'next-gw' && fi[1].props.value === 'next-gw', `${fi[0].props.value} / ${fi[1].props.value}`);
+
 // ---- Headers: key-value rows from saved extraHeaders ----
 check('headers section renders the saved header as a row', kvRows('phub-kvHeaders').length === 1, `got ${kvRows('phub-kvHeaders').length}`);
 const addHeaderButton = buttonByText(zh.addHeader);
