@@ -16,23 +16,28 @@ npm test            # node test/plugin.test.mjs（测试内直连网关时需本
 
 ```
 src/
-├── index.ts          # 插件入口（host）：Config schema / apply / 凭据解析 / 注册
-├── types.ts          # 本地类型（WireConfig / wire 事件形状）
-├── catalog.ts        # 内置主流模型目录 + 条目解析（overrides/custom 合并）
-├── adapter.ts        # GatewayAdapter（LlmAdapter 实现：双协议请求 + chunk 转换）
-├── discovery.ts      # 模型发现（带自定义 UA 拉 GET {baseURL}/models）
+├── index.ts            # 插件入口（host）：Config schema / apply / 凭据解析 / 注册
+├── types.ts            # 本地类型（WireConfig / wire 事件形状）
+├── catalog.ts          # 内置主流模型目录 + 条目解析（overrides/custom 合并）
+├── adapter.ts          # GatewayAdapter（LlmAdapter 实现：三协议请求 + chunk 转换 + 凭据/请求头处理）
+├── discovery.ts        # 模型发现（带自定义 UA 拉 GET {baseURL}/models）
+├── probe.ts            # 连接测试第二段（/models 不通时经首选模型发 "hi" 实聊验证）
+├── url.ts              # endpoint 规范化（/v1 自动补齐 / custom 完整地址，防 /v1/v1）
 ├── host/
-│   ├── contract.ts   # Typert wire 契约（INVOCATIONS / TYPERT_MANIFEST，host+client 共享）
-│   └── runtime.ts    # ProviderHubRuntime（Remote 服务：配置读写/模型管理/发现）
+│   ├── contract.ts     # Typert wire 契约（INVOCATIONS / TYPERT_MANIFEST，host+client 共享）
+│   └── runtime.ts      # ProviderHubRuntime（Remote 服务：配置读写/模型管理/发现/连接测试）
 ├── client/
 │   ├── static.tsx      # client 入口：挂载 Remote 命名空间 + 注册“Provider Hub”左侧面板与 shell overlay
 │   ├── page.tsx        # 「Provider Hub」面板内容（卡片式网格 + cc-switch 风格编辑器：请求头行 / 模型行+目录联想下拉 / 配置 JSON 常驻参数框架双向同步）
 │   ├── locales.ts      # 中/英词典
-│   └── page.css.ts     # 卡片式控制台样式（品牌 hero / 分段页签 / 卡片网格 / 双列表单，--dsw-alias-* tokens）
+│   ├── page.css.ts     # 卡片式控制台样式（品牌 hero / 分段页签 / 卡片网格 / 双列表单，--dsw-alias-* tokens）
+│   └── primitives.d.ts # 宿主 UI 原语类型 shim
+├── client-runtime.d.ts # 宿主全局类型 shim
 └── wire/
-    ├── sse.ts         # 通用 SSE 解析器
-    ├── anthropic.ts   # Anthropic 消息/工具转换 + SSE -> StreamChunk
-    └── openai.ts      # OpenAI 消息转换 + chat.completion.chunk -> StreamChunk
+    ├── sse.ts          # 通用 SSE 解析器
+    ├── anthropic.ts    # Anthropic 消息/工具转换 + SSE -> StreamChunk
+    ├── openai.ts       # OpenAI 消息转换 + chat.completion.chunk -> StreamChunk
+    └── responses.ts    # openai-responses 路径（input/usage/finish 转换）
 ```
 
 构建产出两个 bundle：`lib/index.js`（host，node ESM）+ `lib/client.js`（client，ModuleLoader CJS）。
@@ -46,7 +51,7 @@ src/
 | Models 页卡片 | `ctx.llm.registerConfigurableProviders([...])`（每网关一张卡片） |
 | 模型进选择器 | `ctx.llm.registerAdapter(providers, adapter)` 一次注册全部网关路由（adapter 按 `options.provider` 选路） |
 | 一键发现模型 | `ctx.llm.registerModelDiscovery(NS, discover)`：带自定义 UA 请求 `GET {baseURL}/models`，解析 `context_window`/`max_output_tokens` 等（按网关） |
-| 内置模型参数 | `MODEL_CATALOG`：主流模型（GLM / Claude / GPT / Qwen / DeepSeek）的 contextWindow、maxTokens、输入模态、reasoningEfforts |
+| 内置模型参数 | `MODEL_CATALOG`：主流模型（GLM / Claude / GPT / Qwen / DeepSeek / Kimi / Gemini）的 contextWindow、maxTokens、输入模态、reasoningEfforts |
 
 ## 安装
 
@@ -86,7 +91,7 @@ npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其
    **模型 ID 联想（点选才套用）**：在模型 ID 输入框打字，从**第一个字符**起出现内置目录联想下拉（前缀匹配优先、包含匹配次之，同时匹配显示名；↑↓ 高亮、Enter 选中、Esc 关闭）。**只有点选下拉条目（或 ↑↓+Enter）才写入完整的目录参数**（contextWindow / maxTokens / input / reasoningEfforts 显式展开，可直接修改）——哪怕手动输完整个目录模型名，也不会自动填参，仅预留全字段参数框架。
    **配置 JSON = 常驻完整参数框架 + 独立编辑面**：每个模型组始终保留完整字段框架 `name` / `contextWindow` / `maxTokens` / `input` / `reasoningEfforts`，`null` = 未设置（内置模型保存时继承目录值；自定义模型需填 contextWindow 与 maxTokens，除非网关配置了 `defaultContextWindow` / `defaultMaxTokens`）。列表与 JSON **双向同步**：列表增删改行会迁移 JSON 组；在 JSON 中**手写新组即新增模型**（组内 `name` 即显示名）、**删除组即删除模型**——完全可以不碰模型列表，直接在 JSON 里逐项填参。JSON 文本无效时锁定列表编辑（不覆盖正在编辑的文本），修正后自动解锁。一次保存同时提交基础字段（save-config）与整份模型列表+参数（save-models，写前经模型解析校验）。
 
-3. （可选）点提供方卡片上的“测试连接”直接探测上游 `/models`；在 Models 页该 provider 卡片上点"发现模型"，从网关 `/models` 拉取并采纳。
+3. （可选）点提供方卡片或配置页的“测试连接”，**两段式判定**：先查上游 `/models`——通了即判定可用（横幅显示延迟/模型数，并自动填充下方模型下拉，**不再发对话请求**）；`/models` 不通才回退为**经当前首选模型**（配置页取模型列表第一个非空行——未保存也可测；卡片取已保存配置的第一个已解析模型）直接发送一条 `"hi"` 对话请求，按真实回应判定——横幅显示延迟/所用模型/回复片段与 token 用量。**两段都失败才判定 provider 不可用**（错误信息同时列出两段原因）。
 
 4. 在模型选择器里切到该 provider 下的模型即可使用。
 
@@ -111,7 +116,7 @@ npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其
 
 ## 内置模型目录（MODEL_CATALOG）
 
-GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5 / GPT-5.6 Sol·Luna·Terra / GPT-4o·4o-mini / Qwen3.8-Max·27B / DeepSeek V3·R1·V4 Flash / Kimi K2 / ——含 contextWindow、maxTokens、模态与 reasoningEfforts（GLM-5.3·Flash 按官方规格为 1M 上下文 / 128K 输出，思考始终启用故仅提供 `low`/`high`/`max`；其余推理模型 `off` 到 `max`；GPT-4o·4o-mini·DeepSeek V3 为非推理模型，无映射）。参数为公开规格，网关实际能力以"发现模型"结果为准。
+GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8·4.6 / Sonnet 5·4.6 / Haiku 4.5 / GPT-5.6 Sol·Luna·Terra / GPT-4o·4o-mini / Qwen3.8-Max·27B / DeepSeek V4 Flash·Pro·Flash-Vision-Exp / V3·R1 / Kimi K2 / Gemini 3.8 Flash·3.7 Flash·3.1 Pro ——含 contextWindow、maxTokens、模态与 reasoningEfforts（GLM-5.3 为纯文本、GLM-5.3-Flash 支持图片；DeepSeek V4 Flash·Pro 为纯文本、图片输入在 Flash-Vision-Exp 变体；GLM-5.3·Flash 按官方规格为 1M 上下文 / 128K 输出，思考始终启用故仅提供 `low`/`high`/`max`；DeepSeek V4 家族为 1M 上下文 / 384K 输出，推理档仅 Non-think/High/Max；其余推理模型 `off` 到 `max`；GPT-4o·4o-mini·DeepSeek V3 为非推理模型，无映射）。参数为公开规格，网关实际能力以"发现模型"结果为准。
 
 ## 思考强度派发（reasoningEfforts）
 
@@ -128,7 +133,7 @@ GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5
 
 ## 验证
 
-- 单测（`test/plugin.test.mjs`，全过）：Config schema（多网关）、多网关注册（`registerConfigurableProviders`/`registerAdapter` 各 2 路由）、网关隔离（`listModels` A 不含 B 的模型）、内置+自定义模型解析、`listModels`/`resolveModel`（含 UNKNOWN_MODEL 拒绝）、`prepareCall`、两种协议的 SSE→chunk 转换（文本、流式 tool_use、流式 tool_calls、reasoning_content）、模型发现字段映射、思考强度派发（wire 拼写、off 显式关闭、未声明/未映射档位请求前拒绝、map 校验、lone-off 清理）、runtime 按网关 index 的增删改/provider 改名实时生效（重名/空名拒绝）/自定义。
+- 单测（`test/plugin.test.mjs`，全过）：Config schema（多网关）、多网关注册（`registerConfigurableProviders`/`registerAdapter` 各 2 路由）、网关隔离（`listModels` A 不含 B 的模型）、内置+自定义模型解析、`listModels`/`resolveModel`（含 UNKNOWN_MODEL 拒绝）、`prepareCall`、两种协议的 SSE→chunk 转换（文本、流式 tool_use、流式 tool_calls、reasoning_content）、模型发现字段映射、思考强度派发（wire 拼写、off 显式关闭、未声明/未映射档位请求前拒绝、map 校验、lone-off 清理）、runtime 按网关 index 的增删改/provider 改名实时生效（重名/空名拒绝）/自定义、**两段式连接测试**（/models 优先且成功即止——仅一次请求；/models 不通回退三协议 "hi" 实聊探测、首选模型选取、草稿 model 原样派发、/models 不通且无模型的引导失败、两段皆败合并报错、坏 URL/CRLF 请求头拒绝、上游 401 回显脱敏、凭据 URL 掩码、custom 模式两段各自 verbatim 端点）。
 - 渲染冒烟（`test/client-page.test.mjs`，全过）：面板结构（hero/页签/卡片/编辑器）与模型列表 ⇄ 配置 JSON 双向契约——常驻完整参数框架（null=未设置、目录值不泄漏）、手动输完整目录 id 不自动填参、点选下拉/↑↓+Enter 才套用预设、JSON 手写组重建列表行、无效 JSON 锁定列表编辑。
 - live（假 key）：对按 UA 白名单校验的网关，自定义 UA 生效（UA 关通过、key 关拒绝）；配真 key 即可用。
 

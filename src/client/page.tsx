@@ -85,13 +85,21 @@ interface DiscoveredModel {
   maxTokens?: number;
 }
 
-/** One connection-test outcome, keyed by gateway index (null = cleared). */
+/** One connection-test outcome — models listing first, live-chat fallback —
+ * keyed by gateway index (null = cleared). `via` says which stage proved it. */
 interface TestResult {
   ok: boolean;
+  /** Which stage succeeded: 'models' (listing OK, no chat request) or 'chat'. */
+  via?: 'models' | 'chat';
   endpoint?: string;
   latencyMs?: number;
+  /** models stage: listing count + entries (seeds the fetch list). */
   modelCount?: number;
   models?: DiscoveredModel[];
+  /** chat stage: probed model + reply snippet + usage. */
+  model?: string;
+  reply?: string;
+  usage?: { inputTokens: number; outputTokens: number };
   error?: string;
 }
 
@@ -279,20 +287,28 @@ function SectionHead(title: string, hint: string, actions?: ReactTypes.ReactNode
   );
 }
 
-/** Connection-test banner: green ok (endpoint/latency/sample ids) or red error. */
+/** Connection-test banner: green ok — models listing (count + sample ids) or
+ * live-chat fallback (model + reply snippet) — or red combined error. */
 function TestBanner(props: { test: TestResult; t: Translate }): ReactTypes.ReactElement {
   const { test, t } = props;
+  const usage = test.usage;
+  const reply = String(test.reply ?? '');
   const models = test.models ?? [];
+  const viaChat = test.via === 'chat';
   return React.createElement('div', { className: `phub-test-result ${test.ok ? 'phub-test-ok' : 'phub-test-err'}` },
-    React.createElement('span', null, test.ok
-      ? `✓ ${t('testOk')} · ${String(test.latencyMs ?? 0)}ms · ${String(test.modelCount ?? 0)} ${t('testModels')}${models.length > 0 ? ` · ${t('testSeeded')}` : ''}`
-      : `✕ ${t('testFailed')}`),
+    React.createElement('span', null, !test.ok
+      ? `✕ ${t('testFailed')}`
+      : viaChat
+        ? `✓ ${t('testOk')} · ${String(test.latencyMs ?? 0)}ms · ${String(test.model ?? '')} · ${t('testViaChat')}`
+        : `✓ ${t('testOk')} · ${String(test.latencyMs ?? 0)}ms · ${String(test.modelCount ?? 0)} ${t('testModels')}${models.length > 0 ? ` · ${t('testSeeded')}` : ''}`),
     React.createElement('span', { className: 'phub-test-detail' },
-      test.ok
-        ? `GET ${String(test.endpoint ?? '')}${models.length > 0
-            ? ` → ${models.slice(0, 3).map((m) => m.id).join(', ')}${models.length > 3 ? ' …' : ''}`
-            : ''}`
-        : String(test.error ?? '')),
+      !test.ok
+        ? String(test.error ?? '')
+        : viaChat
+          ? `POST ${String(test.endpoint ?? '')} → ${reply !== '' ? `"${reply}"` : t('testNoReply')}${usage !== undefined ? ` · in ${String(usage.inputTokens)} / out ${String(usage.outputTokens)}` : ''}`
+          : `GET ${String(test.endpoint ?? '')}${models.length > 0
+              ? ` → ${models.slice(0, 3).map((m) => m.id).join(', ')}${models.length > 3 ? ' …' : ''}`
+              : ''}`),
   );
 }
 
@@ -503,8 +519,25 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   };
 
   /**
+   * The editor's current preferred model: the FIRST model row with a
+   * non-empty id (saved or not — the host dispatches it verbatim, so an
+   * unsaved row is testable). Empty when the editor holds no concrete id;
+   * the host then falls back to the gateway's first resolved model.
+   */
+  const editorModel = (): string => {
+    const selected = state.selected;
+    if (selected === null) return '';
+    for (const row of drafts[selected]?.modelRows ?? []) {
+      const id = row.id.trim();
+      if (id !== '') return id;
+    }
+    return '';
+  };
+
+  /**
    * Current form values as a gateway draft for connection probing (the editor
-   * Test button uses it, so UNSAVED edits are reflected immediately).
+   * Test button and the fetch-models listing use it, so UNSAVED edits are
+   * reflected immediately).
    */
   const buildDraft = (): Record<string, unknown> | null => {
     const selected = state.selected;
@@ -529,6 +562,8 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       apiKey: cfg.apiKey,
       apiKeyEnv: cfg.apiKeyEnv,
       extraHeaders,
+      // The chat probe's preferred model (see editorModel).
+      model: editorModel(),
     };
   };
 
@@ -551,21 +586,46 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     };
   };
 
-  /** Adopt a test-connection envelope: banner + (on success) seed the fetch list. */
+  /** Adopt a test-connection envelope (models stage or chat fallback) into
+   * the banner; a models-stage success also seeds the fetch list. */
   const applyTestResult = (index: number, r: Record<string, unknown> & { ok: boolean }): void => {
     if (!r.ok) {
       setTestResult((tr) => ({ ...tr, [index]: { ok: false, error: String((r as { error?: unknown }).error ?? '') } }));
       return;
     }
-    const res = r as unknown as { endpoint: string; latencyMs: number; modelCount: number; models?: DiscoveredModel[] };
-    const models = Array.isArray(res.models) ? res.models : [];
-    setTestResult((tr) => ({ ...tr, [index]: { ok: true, endpoint: res.endpoint, latencyMs: res.latencyMs, modelCount: res.modelCount, models } }));
-    // The probe already fetched the listing: reuse it so models can be
-    // enabled without a second round-trip.
-    setDiscovered((d) => ({ ...d, [index]: models }));
+    const res = r as unknown as {
+      via?: 'models' | 'chat';
+      endpoint?: string;
+      latencyMs?: number;
+      modelCount?: number;
+      models?: DiscoveredModel[];
+      model?: string;
+      reply?: string;
+      usage?: { inputTokens: number; outputTokens: number };
+    };
+    const models = Array.isArray(res.models) ? res.models : undefined;
+    setTestResult((tr) => ({
+      ...tr,
+      [index]: {
+        ok: true,
+        via: res.via,
+        endpoint: res.endpoint,
+        latencyMs: res.latencyMs,
+        modelCount: res.modelCount,
+        models,
+        model: res.model,
+        reply: res.reply,
+        usage: res.usage,
+      },
+    }));
+    // The models stage already fetched the listing: reuse it so models can
+    // be enabled without a second round-trip (the chat stage has none).
+    if (models !== undefined) setDiscovered((d) => ({ ...d, [index]: models }));
   };
 
-  /** Probe GET {baseURL}/models with the CURRENT editor form values (no save needed). */
+  /** Test the connection with the CURRENT editor form values (no save
+   * needed): the host checks the models listing first and falls back to a
+   * real "hi" chat request through the preferred model (editorModel). */
   const runTest = () => {
     const selected = state.selected;
     if (selected === null) return;
@@ -582,7 +642,9 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
     })();
   };
 
-  /** Probe a card straight from its SAVED config (editor may be closed). */
+  /** Probe a card straight from its SAVED config (editor may be closed): the
+   * host tries the models listing first, then the chat fallback through the
+   * gateway's first resolved model. */
   const runCardTest = (index: number) => {
     const draft = buildSavedDraft(index);
     if (draft === null) return;
@@ -654,8 +716,11 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
 
   /**
    * Fetch the upstream model listing with the CURRENT form values (the same
-   * draft the Test button probes — unsaved URL/key edits are included), then
-   * offer it in the picker for one-click row adds.
+   * draft the Test button probes — unsaved URL/key edits are included)
+   * through the discover RPC, then offer it in the picker for one-click row
+   * adds. The listing endpoint is intentionally separate from the connection
+   * test: the Test button sends a real chat request and judges from the
+   * model's reply, while this dials /models to enumerate ids.
    */
   const runFetchModels = () => {
     const selected = state.selected;
@@ -666,7 +731,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
       setDiscovering(selected);
       setDiscovered((d) => ({ ...d, [selected]: null }));
       try {
-        const r = await call('test-connection', { index: selected, draft });
+        const r = await call('discover', { index: selected, draft });
         if (!r.ok) {
           setStatus({ kind: 'err', text: String((r as { error?: unknown }).error ?? '') });
           return;
@@ -995,6 +1060,13 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
   // Model ids already in the open editor's rows (marks fetched / dropdown
   // options as taken). Trimmed: group keys and save-time ids are trimmed.
   const listedIds = new Set((draft?.modelRows ?? []).map((row) => row.id.trim()).filter((id) => id !== ''));
+  // Probe readiness of the open editor: auto mode needs the baseURL (both
+  // stages derive from it); custom mode can run either stage — the listing
+  // dials `baseURL` verbatim, the chat fallback dials the complete
+  // `endpoint` — so ONE of the two is enough.
+  const probeReady = String(cfg.endpointMode ?? 'auto') === 'custom'
+    ? String(cfg.endpoint ?? '').trim() !== '' || String(cfg.baseURL ?? '').trim() !== ''
+    : String(cfg.baseURL ?? '').trim() !== '';
 
   /** One provider card for the grid. */
   const gatewayCard = (g: GatewayEntry): ReactTypes.ReactElement => {
@@ -1368,7 +1440,7 @@ export function ProviderHubPage(props: PageProps): React.ReactElement {
         }, t('save')),
         React.createElement(Button, {
           variant: 'outline', size: 'sm',
-          disabled: busy || testing !== null || String(cfg.baseURL ?? '').trim() === '',
+          disabled: busy || testing !== null || !probeReady,
           icon: testing === selected ? React.createElement(IconLoadingOutline16, { size: 14, className: 'phub-spin' }) : undefined,
           onClick: runTest,
         }, testing === selected ? t('testing') : t('testConnection')),

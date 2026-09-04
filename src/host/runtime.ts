@@ -23,6 +23,7 @@ import { assertUsableApiKey, type LlmDiscoveredModel } from '@deepseek-ai/dsh-ll
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { MODEL_CATALOG, gatewayModelDefaults, positiveInt, resolveModelEntries } from '../catalog.ts';
 import { discoverModels } from '../discovery.ts';
+import { probeChatConnection } from '../probe.ts';
 import { DEFAULT_USER_AGENT, type GatewayConfig, type WireConfig } from '../types.ts';
 import { redactUrl, resolveEndpointUrl } from '../url.ts';
 
@@ -158,6 +159,66 @@ function validateModelEntry(raw: unknown): ValidatedModelEntry {
     }
   }
   return { id, originalId, fields };
+}
+
+/**
+ * Merge one typert draft over a saved gateway: every field falls back to the
+ * saved value when the draft's is ill-typed (a draft crossing the wire as a
+ * plain object never corrupts the probe), and wire-critical fields (URLs,
+ * UA, headers) are validated with the same rules saveConfig enforces, so a
+ * bad draft fails with a named field instead of an opaque fetch error.
+ * Field-requiredness is deliberately NOT checked here: which URL a probe
+ * needs depends on the endpoint mode and the resource (auto needs baseURL;
+ * custom-mode chat needs `endpoint`, custom-mode listing needs `baseURL`),
+ * and the unified endpoint resolver already refuses each miss with a
+ * precise, redacted message. Shared by testConnection (both its stages) and
+ * discover (draft-based model listing).
+ */
+function mergeDraftGateway(saved: GatewayConfig, draft: Record<string, unknown>): { gateway: GatewayConfig } | { error: string } {
+  const str = (v: unknown, fallback: string): string => (typeof v === 'string' ? v : fallback);
+  const api = draft.api;
+  const headers: unknown = draft.extraHeaders === undefined ? saved.extraHeaders : draft.extraHeaders;
+  if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) {
+    return { error: 'extraHeaders must be a JSON object' };
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value !== 'string') return { error: `extraHeaders.${name} must be a string` };
+    if (/[\r\n]/.test(name) || /[\r\n]/.test(value)) return { error: `extraHeaders.${name} must not contain line breaks` };
+  }
+  const gateway: GatewayConfig = {
+    ...saved,
+    provider: str(draft.provider, saved.provider),
+    displayName: str(draft.displayName, saved.displayName),
+    baseURL: str(draft.baseURL, saved.baseURL ?? ''),
+    api: api === 'openai-completions' || api === 'anthropic-messages' || api === 'openai-responses' ? api : saved.api,
+    endpointMode: draft.endpointMode === 'custom' || draft.endpointMode === 'auto' ? draft.endpointMode : saved.endpointMode,
+    endpoint: str(draft.endpoint, saved.endpoint ?? ''),
+    userAgent: str(draft.userAgent, saved.userAgent),
+    apiKey: str(draft.apiKey, saved.apiKey),
+    apiKeyEnv: str(draft.apiKeyEnv, saved.apiKeyEnv),
+    extraHeaders: headers as Record<string, string>,
+  };
+  const baseURL = (gateway.baseURL ?? '').trim();
+  if (baseURL !== '') {
+    try {
+      const parsed = new URL(baseURL);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return { error: 'Base URL must use http or https' };
+    } catch {
+      return { error: 'Base URL is not a valid URL' };
+    }
+  }
+  if (/[\r\n]/.test(gateway.userAgent)) return { error: 'userAgent must not contain line breaks' };
+  const endpoint = (gateway.endpoint ?? '').trim();
+  if (endpoint !== '') {
+    if (/[\r\n]/.test(endpoint)) return { error: 'endpoint must not contain line breaks' };
+    try {
+      const parsedEndpoint = new URL(endpoint);
+      if (parsedEndpoint.protocol !== 'http:' && parsedEndpoint.protocol !== 'https:') return { error: 'endpoint must use http or https' };
+    } catch {
+      return { error: 'endpoint is not a valid URL' };
+    }
+  }
+  return { gateway };
 }
 
 export class ProviderHubRuntime extends TypertRemoteService {
@@ -835,10 +896,22 @@ export class ProviderHubRuntime extends TypertRemoteService {
     }
   }
 
-  /** Discover models with the saved gateway configuration. */
-  async discover(index: number): Promise<Envelope> {    try {
-      const gw = this.gatewayAt(index);
-      if (gw === undefined) return fail('gateway index out of range');
+  /**
+   * Discover models with the saved gateway configuration, or over an UNSAVED
+   * draft (the same merge testConnection applies) when the client sends one —
+   * the settings page's fetch-models button probes the CURRENT form values
+   * without persisting first.
+   */
+  async discover(index: number, draft?: Record<string, unknown> | null): Promise<Envelope> {
+    try {
+      const saved = this.gatewayAt(index);
+      if (saved === undefined) return fail('gateway index out of range');
+      let gw = saved;
+      if (draft !== null && draft !== undefined) {
+        const merged = mergeDraftGateway(saved, draft);
+        if ('error' in merged) return fail(merged.error);
+        gw = merged.gateway;
+      }
       const models: LlmDiscoveredModel[] = await discoverModels({}, gw, () => this.deps.resolveApiKey(gw));
       return ok({ models });
     } catch (error) {
@@ -847,89 +920,99 @@ export class ProviderHubRuntime extends TypertRemoteService {
   }
 
   /**
-   * Test an unsaved gateway draft against GET {baseURL}/models. This is kept
-   * separate from discover(): the settings page can verify a freshly typed
-   * URL/key/UA/header combination without persisting it first. The FULL model
-   * listing rides along in the envelope so the client can seed its discovery
-   * list without a second round-trip.
+   * Test an unsaved gateway draft in TWO stages, each judged from its
+   * response — the provider is reported unavailable only when BOTH fail:
+   *
+   *   1. the models listing (GET {baseURL}/models; custom mode dials baseURL
+   *      verbatim). Success already proves the gateway is reachable and
+   *      authorized — NO chat request is sent, and the listing rides along
+   *      so the client can seed its fetch list without a second round-trip.
+   *   2. only when the listing fails: ONE real "hi" chat request through the
+   *      current preferred model, on the same wire path the live adapter
+   *      uses (protocol-correct auth, custom User-Agent, unified endpoint
+   *      resolver, streaming SSE) — so a gateway without a /models endpoint
+   *      (or one that gates it) is still judged by what actually matters:
+   *      the chat path.
+   *
+   * The preferred model for stage 2 is the draft's `model` when the client
+   * sends one (the editor's first model row — saved or not, dispatched
+   * verbatim); otherwise the gateway's first resolved model entry. Each
+   * stage gets its own 15-second budget; the combined failure names both
+   * probes. Kept separate from discover(): the settings page can verify a
+   * freshly typed URL/key/UA/model combination without persisting first.
    */
   async testConnection(index: number, draft: Record<string, unknown>): Promise<Envelope> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
     try {
       const saved = this.gatewayAt(index);
       if (saved === undefined) return fail('gateway index out of range');
-      // The draft crosses the typert boundary as a plain object: merge it over
-      // the saved gateway field by field, keeping every field type-safe
-      // (an ill-typed draft falls back to the saved value instead of
-      // corrupting the probe).
-      const str = (v: unknown, fallback: string): string => (typeof v === 'string' ? v : fallback);
-      const api = draft.api;
-      const headers: unknown = draft.extraHeaders === undefined ? saved.extraHeaders : draft.extraHeaders;
-      if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) {
-        return fail('extraHeaders must be a JSON object');
-      }
-      for (const [name, value] of Object.entries(headers)) {
-        if (typeof value !== 'string') return fail(`extraHeaders.${name} must be a string`);
-        if (/[\r\n]/.test(name) || /[\r\n]/.test(value)) return fail(`extraHeaders.${name} must not contain line breaks`);
-      }
-      const testGateway: GatewayConfig = {
-        ...saved,
-        provider: str(draft.provider, saved.provider),
-        displayName: str(draft.displayName, saved.displayName),
-        baseURL: str(draft.baseURL, saved.baseURL ?? ''),
-        api: api === 'openai-completions' || api === 'anthropic-messages' || api === 'openai-responses' ? api : saved.api,
-        endpointMode: draft.endpointMode === 'custom' || draft.endpointMode === 'auto' ? draft.endpointMode : saved.endpointMode,
-        endpoint: str(draft.endpoint, saved.endpoint ?? ''),
-        userAgent: str(draft.userAgent, saved.userAgent),
-        apiKey: str(draft.apiKey, saved.apiKey),
-        apiKeyEnv: str(draft.apiKeyEnv, saved.apiKeyEnv),
-        extraHeaders: headers as Record<string, string>,
-      };
-      // str() guarantees a string, but the GatewayConfig annotation widens the
-      // field back to `string | undefined`.
-      const baseURL = (testGateway.baseURL ?? '').trim();
-      if (baseURL === '') return fail('Base URL is required');
-      let parsed: URL;
-      try {
-        parsed = new URL(baseURL);
-      } catch {
-        return fail('Base URL is not a valid URL');
-      }
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return fail('Base URL must use http or https');
-      if (/[\r\n]/.test(testGateway.userAgent)) return fail('userAgent must not contain line breaks');
-      const endpoint = (testGateway.endpoint ?? '').trim();
-      if (endpoint !== '') {
-        if (/[\r\n]/.test(endpoint)) return fail('endpoint must not contain line breaks');
+      const merged = mergeDraftGateway(saved, draft);
+      if ('error' in merged) return fail(merged.error);
+      const testGateway = merged.gateway;
+      // ---- Stage 1: the models listing. Success ends the test here. ----
+      let modelsError: string | undefined;
+      let listing: LlmDiscoveredModel[] | undefined;
+      let listingLatency = 0;
+      {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15_000);
+        const started = Date.now();
         try {
-          const parsedEndpoint = new URL(endpoint);
-          if (parsedEndpoint.protocol !== 'http:' && parsedEndpoint.protocol !== 'https:') return fail('endpoint must use http or https');
-        } catch {
-          return fail('endpoint is not a valid URL');
+          listing = await discoverModels({ signal: controller.signal }, testGateway, () => this.deps.resolveApiKey(testGateway));
+          listingLatency = Date.now() - started;
+        } catch (error) {
+          modelsError = controller.signal.aborted
+            ? 'the models listing timed out after 15 seconds'
+            : error instanceof Error ? error.message : String(error);
+        } finally {
+          clearTimeout(timeout);
         }
       }
-      const started = Date.now();
-      // The probe dials through the same unified resolver as the live adapter:
-      // auto mode derives {baseURL}/models with /v1 normalization; custom mode
-      // dials baseURL verbatim as the complete models URL.
-      const resolved = resolveEndpointUrl({ baseURL, endpointMode: testGateway.endpointMode }, '/models');
-      if (!resolved.ok) return fail(resolved.error);
-      const models = await discoverModels(
-        { baseURL, signal: controller.signal },
-        testGateway,
-        () => this.deps.resolveApiKey(testGateway),
-      );
-      return ok({
-        endpoint: redactUrl(resolved.url),
-        latencyMs: Date.now() - started,
-        modelCount: models.length,
-        models,
-      });
+      if (modelsError === undefined && listing !== undefined) {
+        const resolved = resolveEndpointUrl(testGateway, '/models');
+        return ok({
+          via: 'models',
+          ...(resolved.ok ? { endpoint: redactUrl(resolved.url) } : {}),
+          latencyMs: listingLatency,
+          modelCount: listing.length,
+          models: listing,
+        });
+      }
+      const modelsFailure = modelsError ?? 'the models listing failed';
+      // ---- Stage 2: live-chat fallback through the preferred model. ----
+      // Preferred model: the explicit draft model wins (verbatim, so an
+      // unsaved editor row is testable); otherwise the gateway's first
+      // resolved entry.
+      let model = typeof draft.model === 'string' ? draft.model.trim() : '';
+      if (model === '') {
+        try {
+          model = resolveModelEntries(testGateway)[0]?.id ?? '';
+        } catch (error) {
+          return fail(`models endpoint failed: ${modelsFailure}; and the gateway's model list does not resolve — ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (model === '') {
+        return fail(`models endpoint failed: ${modelsFailure}; and no model is configured for a chat probe — add a model to this gateway first`);
+      }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15_000);
+      try {
+        const probe = await probeChatConnection(
+          testGateway,
+          model,
+          () => this.deps.resolveApiKey(testGateway),
+          controller.signal,
+        );
+        return ok({ via: 'chat', ...probe });
+      } catch (error) {
+        const chatError = controller.signal.aborted
+          ? 'the chat probe timed out after 15 seconds'
+          : error instanceof Error ? error.message : String(error);
+        return fail(`models endpoint failed: ${modelsFailure}; chat probe through "${model}" also failed: ${chatError}`);
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch (error) {
-      if (controller.signal.aborted) return fail('Connection timed out after 15 seconds');
       return fail(error);
-    } finally {
-      clearTimeout(timeout);
     }
   }
 

@@ -62,10 +62,11 @@ DSH（DeepSeek Harness）LLM **provider 中枢插件**：通过 DSH 左侧栏的
 │   ├── catalog.ts                # 内置模型目录 MODEL_CATALOG + 条目解析（overrides/custom 合并）
 │   ├── adapter.ts                # GatewayAdapter：三协议请求派发 + chunk 转换 + 凭据/请求头处理
 │   ├── discovery.ts              # 模型发现（带自定义 UA 拉 GET {baseURL}/models）
+│   ├── probe.ts                  # 连接测试第二段（/models 不通时经首选模型发 "hi" 实聊验证）
 │   ├── url.ts                    # endpoint 规范化（/v1 自动补齐，防 /v1/v1）
 │   ├── host/
 │   │   ├── contract.ts           # typert wire 契约（INVOCATIONS / TYPERT_MANIFEST / METHODS 三处同步）
-│   │   └── runtime.ts            # ProviderHubRuntime（Remote：配置读写/模型管理/发现）
+│   │   └── runtime.ts            # ProviderHubRuntime（Remote：配置读写/模型管理/发现/连接测试）
 │   ├── client/
 │   │   ├── static.tsx            # client 入口：remote $mount + Provider Hub 面板注册
 │   │   ├── page.tsx              # 面板内容（卡片式网格 + 编辑器）

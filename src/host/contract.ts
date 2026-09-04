@@ -147,7 +147,7 @@ export const INVOCATIONS = [
   invocation('upsertModel', 'upsertModel', [numberParam('index'), objectParam('entry'), booleanParam('overwrite'), nullishStringArrayParam('clearFields')]),
   invocation('deleteModel', 'deleteModel', [numberParam('index'), stringParam('id')]),
   invocation('saveModels', 'saveModels', [numberParam('index'), objectArrayParam('models'), objectParam('params')]),
-  invocation('discover', 'discover', [numberParam('index')]),
+  invocation('discover', 'discover', [numberParam('index'), nullishObjectParam('draft')]),
   invocation('testConnection', 'testConnection', [numberParam('index'), objectParam('draft')]),
   invocation('enableDiscovered', 'enableDiscovered', [numberParam('index'), objectParam('model')]),
 ];
@@ -162,7 +162,7 @@ export const TYPERT_MANIFEST = {
       {
         key: 'providerHub',
         exportName: 'ProviderHubRuntime',
-        description: 'Manage provider-hub gateways and model catalogs: read/write settings, add/remove routes, test draft credentials, edit models, and discover upstream models.',
+        description: 'Manage provider-hub gateways and model catalogs: read/write settings, add/remove routes, test draft gateways (models listing first, live-chat fallback), edit models, and discover upstream models.',
         tags: [],
         members: [
           { kind: 'method', name: 'getState', signature: 'getState(): Promise<object>' },
@@ -176,7 +176,7 @@ export const TYPERT_MANIFEST = {
           { kind: 'method', name: 'upsertModel', signature: 'upsertModel(index: number, entry: object, overwrite: boolean, clearFields: string[] | null): Promise<object>' },
           { kind: 'method', name: 'deleteModel', signature: 'deleteModel(index: number, id: string): Promise<object>' },
           { kind: 'method', name: 'saveModels', signature: 'saveModels(index: number, models: object[], params: object): Promise<object>' },
-          { kind: 'method', name: 'discover', signature: 'discover(index: number): Promise<object>' },
+          { kind: 'method', name: 'discover', signature: 'discover(index: number, draft: object | null): Promise<object>' },
           { kind: 'method', name: 'testConnection', signature: 'testConnection(index: number, draft: object): Promise<object>' },
           { kind: 'method', name: 'enableDiscovered', signature: 'enableDiscovered(index: number, model: object): Promise<object>' },
         ],

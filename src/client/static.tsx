@@ -58,7 +58,7 @@ const PARAM_ORDER: Record<string, string[]> = {
   'upsert-model': ['index', 'entry', 'overwrite', 'clearFields'],
   'delete-model': ['index', 'id'],
   'save-models': ['index', 'models', 'params'],
-  'discover': ['index'],
+  'discover': ['index', 'draft'],
   'test-connection': ['index', 'draft'],
   'enable-discovered': ['index', 'model'],
 };

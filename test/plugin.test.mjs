@@ -71,9 +71,9 @@ const gw0 = config.gateways[0];
 const entries = plugin.resolveModelEntries(gw0);
 check('entries: 3 (2 builtin + 1 custom)', entries.length === 3, `got ${entries.length}: ${entries.map((e) => e.id).join(',')}`);
 const builtin = entries.find((e) => e.id === 'claude-opus-4-8');
-check('builtin entry params', builtin.contextWindow === 1000000 && builtin.maxTokens === 32768 && builtin.input.includes('image'));
+check('builtin entry params', builtin.contextWindow === 1000000 && builtin.maxTokens === 131072 && builtin.input.includes('image'));
 const overridden = entries.find((e) => e.id === 'glm-5.3');
-check('modelOverrides applied field-wise', overridden.contextWindow === 999999 && overridden.maxTokens === 8888 && overridden.input.includes('image') && overridden.name === 'GLM-5.3', JSON.stringify({ cw: overridden.contextWindow, mt: overridden.maxTokens, input: overridden.input, name: overridden.name }));
+check('modelOverrides applied field-wise', overridden.contextWindow === 999999 && overridden.maxTokens === 8888 && overridden.input.includes('text') && !overridden.input.includes('image') && overridden.name === 'GLM-5.3', JSON.stringify({ cw: overridden.contextWindow, mt: overridden.maxTokens, input: overridden.input, name: overridden.name }));
 const custom = entries.find((e) => e.id === 'my-model');
 check('custom entry params', custom.contextWindow === 64000 && custom.maxTokens === 4096);
 
@@ -176,6 +176,13 @@ const server = http.createServer((req, res) => {
     lastBody = body;
     lastSeenHeaders = { url: req.url, ua: req.headers['user-agent'], key: req.headers['x-api-key'] ?? req.headers['authorization']?.slice(0, 12), body: body.slice(0, 120), full: req.headers };
     if (req.url.endsWith('/models')) {
+      if (req.headers['x-test-models-down']) {
+        // Gateways without (or gating) the /models listing: the connection
+        // test must fall back to the live-chat probe instead.
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'no model listing here' } }));
+        return;
+      }
       if (req.headers['x-test-big']) {
         // >4 MiB listing: discovery must refuse via its read cap (offline test
         // for the body cap — never a real upstream).
@@ -247,6 +254,13 @@ const server = http.createServer((req, res) => {
       for (const ev of oaiEvents) res.write(`data: ${JSON.stringify(ev)}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
+      return;
+    }
+    if (req.url.endsWith('/messages') && req.headers['x-test-echo-key']) {
+      // Chat-probe auth failure: echo the x-api-key back in an error body —
+      // the probe must scrub the credential from the surfaced failure.
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `auth failed for ${req.headers['x-api-key']}` } }));
       return;
     }
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -542,13 +556,33 @@ check('runtime deleteGateway', dg.ok === true && stored.gateways.length === 1, J
 const rd = await runtime.discover(0);
 check('runtime discover via echo', rd.ok === true && rd.models.length === 2 && rd.models[0].id === 'glm-5.3', JSON.stringify(rd.models));
 
-// 9a. testConnection: probe an UNSAVED draft (URL/key/headers) against /models.
-// The full listing rides along so the settings page can seed its discovery
-// list without a second fetch; a bare host is normalized to /v1/models.
+// 9a. testConnection, TWO stages over an UNSAVED draft (URL/key/headers/model):
+// stage 1 checks GET {baseURL}/models — success proves the gateway and rides
+// the listing along (no chat request); stage 2, only when the listing fails,
+// sends ONE real "hi" chat request through the current preferred model
+// (draft.model verbatim, else the first resolved entry). The provider is
+// unavailable only when BOTH fail — the combined error names both probes.
 const tc = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996/', apiKey: 'sk-draft', extraHeaders: {} });
-check('runtime testConnection ok (draft, bare host -> /v1/models)', tc.ok === true && tc.modelCount === 2 && tc.models.length === 2 && typeof tc.latencyMs === 'number' && tc.endpoint === 'http://127.0.0.1:18996/v1/models', JSON.stringify(tc));
+check('runtime testConnection ok (models stage, bare host -> /v1/models, listing rides along)', tc.ok === true && tc.via === 'models' && tc.modelCount === 2 && tc.models.length === 2 && typeof tc.latencyMs === 'number' && tc.endpoint === 'http://127.0.0.1:18996/v1/models', JSON.stringify(tc));
 const tcV1 = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996/v1', apiKey: 'sk-draft', extraHeaders: {} });
-check('runtime testConnection ok (draft, explicit /v1 root not doubled)', tcV1.ok === true && tcV1.endpoint === 'http://127.0.0.1:18996/v1/models' && tcV1.modelCount === 2, JSON.stringify(tcV1));
+check('runtime testConnection ok (explicit /v1 root not doubled)', tcV1.ok === true && tcV1.via === 'models' && tcV1.endpoint === 'http://127.0.0.1:18996/v1/models' && tcV1.modelCount === 2, JSON.stringify(tcV1));
+// A working listing ends the test: exactly ONE request, no chat dial.
+const beforeModelsOnly = requestCount;
+const tcModelsOnly = await runtime.testConnection(0, { apiKey: 'sk-draft', extraHeaders: {} });
+check('runtime testConnection: models OK means no chat request (exactly one dial)', tcModelsOnly.ok === true && tcModelsOnly.via === 'models' && requestCount === beforeModelsOnly + 1, JSON.stringify({ via: tcModelsOnly.via, dials: requestCount - beforeModelsOnly }));
+// /models gated (404): the chat fallback through the preferred model proves
+// the provider usable — stage 2's endpoint, model, and reply all reported.
+const tcChat = await runtime.testConnection(0, { extraHeaders: { 'x-test-models-down': '1' } });
+check('runtime testConnection: /models down -> live-chat fallback via /v1/messages (glm-5.3)', tcChat.ok === true && tcChat.via === 'chat' && tcChat.model === 'glm-5.3' && tcChat.endpoint === 'http://127.0.0.1:18996/v1/messages' && String(tcChat.reply ?? '').includes('Hello world'), JSON.stringify(tcChat));
+// draft.model wins and is dispatched verbatim (an unsaved editor row is testable).
+const tcModel = await runtime.testConnection(0, { model: 'brand-new-model', extraHeaders: { 'x-test-models-down': '1' } });
+check('runtime testConnection: draft.model probed verbatim (unsaved id ok)', tcModel.ok === true && tcModel.via === 'chat' && tcModel.model === 'brand-new-model' && lastBody.includes('"brand-new-model"'), JSON.stringify({ ok: tcModel.ok, model: tcModel.model, error: tcModel.error }));
+// Protocol dispatch through the draft api field: each chat path dials its
+// own endpoint shape and reads the reply from the matching SSE dialect.
+const tcOai = await runtime.testConnection(0, { api: 'openai-completions', apiKey: 'sk-draft', extraHeaders: { 'x-test-models-down': '1' } });
+check('runtime testConnection: openai fallback probes /v1/chat/completions and reads the reply', tcOai.ok === true && tcOai.via === 'chat' && tcOai.endpoint === 'http://127.0.0.1:18996/v1/chat/completions' && String(tcOai.reply ?? '').includes('hi there'), JSON.stringify(tcOai));
+const tcResp = await runtime.testConnection(0, { api: 'openai-responses', apiKey: 'sk-draft', extraHeaders: { 'x-test-models-down': '1' } });
+check('runtime testConnection: responses fallback probes /v1/responses and reads the reply', tcResp.ok === true && tcResp.via === 'chat' && tcResp.endpoint === 'http://127.0.0.1:18996/v1/responses' && String(tcResp.reply ?? '').includes('hello from responses'), JSON.stringify(tcResp));
 // A draft apiKey merges over the saved one (empty literal -> env fallback).
 const tcKey = await runtime.testConnection(0, { apiKey: '' });
 check('runtime testConnection: empty draft apiKey falls back (env path)', tcKey.ok === true, String(tcKey.error));
@@ -557,16 +591,31 @@ check('runtime testConnection rejects invalid URL', tcBadUrl.ok === false && /va
 const tcBadHeaders = await runtime.testConnection(0, { extraHeaders: { 'x-a': 1 } });
 check('runtime testConnection rejects non-string header value', tcBadHeaders.ok === false && /extraHeaders/.test(String(tcBadHeaders.error)), String(tcBadHeaders.error));
 const tcDead = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:1/' });
-check('runtime testConnection unreachable endpoint fails', tcDead.ok === false && /could not reach/.test(String(tcDead.error)), String(tcDead.error));
+check('runtime testConnection: both stages fail -> combined error naming both probes', tcDead.ok === false && /models endpoint failed/.test(String(tcDead.error)) && /also failed/.test(String(tcDead.error)) && /could not reach/.test(String(tcDead.error)), String(tcDead.error));
 // URL-embedded credentials must never surface in error messages.
 const tcCred = await runtime.testConnection(0, { baseURL: 'http://user:sekret@127.0.0.1:1/' });
 check('runtime testConnection: URL credentials redacted in errors', tcCred.ok === false && !String(tcCred.error).includes('sekret') && /\*\*\*/.test(String(tcCred.error)), String(tcCred.error));
-// A listing larger than the 4 MiB body cap must be refused (offline: the echo
-// server sends ~5 MiB when the x-test-big header is present).
-const tcBig = await runtime.testConnection(0, { extraHeaders: { 'x-test-big': '1' } });
-check('runtime testConnection: >4 MiB listing refused by read cap', tcBig.ok === false && /4 MiB/.test(String(tcBig.error)), String(tcBig.error));
+// An upstream error body echoing the API key (misconfigured gateways bounce
+// credentials back) must surface scrubbed, with the check-the-key hint.
+const tcEcho = await runtime.testConnection(0, { extraHeaders: { 'x-test-models-down': '1', 'x-test-echo-key': '1' } });
+check('runtime testConnection: upstream 401 echo scrubbed of the API key + key hint', tcEcho.ok === false && String(tcEcho.error).includes('upstream 401') && String(tcEcho.error).includes('check the API key') && !String(tcEcho.error).includes('sk-test'), String(tcEcho.error));
+// /models gated AND no model configured: the chat fallback cannot run — the
+// failure must say so, and only the listing dial happened (no chat request).
+const noModelStored = { gateways: [{ ...stored.gateways[0], enabledModels: [], modelOverrides: {}, customModels: [] }] };
+const noModelRuntime = new ProviderHubRuntime(
+  { get: (n) => (n === 'settings' ? fakeSettings : n === 'llm' ? fakeLlm : n === 'credentials' ? runtimeCredentials : undefined), reflect: { provide: () => {} } },
+  { current: () => noModelStored, resolveApiKey: async () => 'sk-test', gatewayFor: (p) => noModelStored.gateways.find((g) => g.provider === p), log: () => {} },
+);
+const beforeNoModel = requestCount;
+const tcNoModel = await noModelRuntime.testConnection(0, { extraHeaders: { 'x-test-models-down': '1' } });
+check('runtime testConnection: /models down + no model fails with guidance (listing dial only)', tcNoModel.ok === false && /models endpoint failed/.test(String(tcNoModel.error)) && /no model is configured for a chat probe/.test(String(tcNoModel.error)) && requestCount === beforeNoModel + 1, String(tcNoModel.error));
 const tcBadHeaderInject = await runtime.testConnection(0, { extraHeaders: { 'x-a': 'v\nX-Inject: y' } });
 check('runtime testConnection rejects CRLF header value', tcBadHeaderInject.ok === false && /line breaks/.test(String(tcBadHeaderInject.error)), String(tcBadHeaderInject.error));
+// The 4 MiB listing read cap also guards testConnection's stage 1.
+const rdBig = await runtime.discover(0, { extraHeaders: { 'x-test-big': '1' } });
+check('runtime discover (draft): >4 MiB listing refused by read cap', rdBig.ok === false && /4 MiB/.test(String(rdBig.error)), String(rdBig.error));
+const rdDraft = await runtime.discover(0, { baseURL: 'http://127.0.0.1:18996', apiKey: 'sk-draft' });
+check('runtime discover (draft): listing fetched with the current form values', rdDraft.ok === true && rdDraft.models?.length === 2, JSON.stringify({ ok: rdDraft.ok, error: rdDraft.error }));
 const ro = await runtime.saveOverrides(0, { 'glm-5.3': { contextWindow: 999999 } });
 check('runtime saveOverrides', ro.ok === true && stored.gateways[0].modelOverrides['glm-5.3'].contextWindow === 999999);
 
@@ -1044,10 +1093,14 @@ check('discovery openai-responses: Bearer used, x-api-key not overridable', last
 const customDiscGw = { ...discBase, api: 'openai-completions', endpointMode: 'custom', extraHeaders: {} };
 await discoverModels({ baseURL: 'http://127.0.0.1:18996/api/models', apiKey: 'sk-disc' }, customDiscGw, async () => 'sk-disc');
 check('discovery custom mode: baseURL IS the complete models URL (no join)', lastSeenHeaders?.url === '/api/models', String(lastSeenHeaders?.url));
-const tcCustomModels = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996/api/models', endpointMode: 'custom', apiKey: 'sk-draft' });
-check('runtime testConnection custom mode: envelope reports the verbatim models URL', tcCustomModels.ok === true && tcCustomModels.endpoint === 'http://127.0.0.1:18996/api/models', JSON.stringify({ ok: tcCustomModels.ok, endpoint: tcCustomModels.endpoint, error: tcCustomModels.error }));
+// Custom mode: stage 1 dials baseURL verbatim as the models URL; when that
+// fails (gated here), stage 2 dials the complete `endpoint` URL verbatim.
+const tcCustomChat = await runtime.testConnection(0, { endpointMode: 'custom', baseURL: 'http://127.0.0.1:18996/api/models', endpoint: 'http://127.0.0.1:18996/custom/v1/messages', apiKey: 'sk-draft', extraHeaders: { 'x-test-models-down': '1' } });
+check('runtime testConnection custom mode: /models down -> chat fallback dials the verbatim endpoint URL', tcCustomChat.ok === true && tcCustomChat.via === 'chat' && tcCustomChat.endpoint === 'http://127.0.0.1:18996/custom/v1/messages', JSON.stringify({ ok: tcCustomChat.ok, via: tcCustomChat.via, endpoint: tcCustomChat.endpoint, error: tcCustomChat.error }));
+const rdCustomModels = await runtime.discover(0, { baseURL: 'http://127.0.0.1:18996/api/models', endpointMode: 'custom', apiKey: 'sk-draft' });
+check('runtime discover custom mode: baseURL IS the verbatim models URL', rdCustomModels.ok === true && lastSeenHeaders?.url === '/api/models', JSON.stringify({ ok: rdCustomModels.ok, url: lastSeenHeaders?.url, error: rdCustomModels.error }));
 const tcBadEndpointMode = await runtime.testConnection(0, { baseURL: 'http://127.0.0.1:18996', endpointMode: 'nonsense' });
-check('runtime testConnection: unknown endpointMode draft falls back to saved (auto)', tcBadEndpointMode.ok === true && tcBadEndpointMode.endpoint === 'http://127.0.0.1:18996/v1/models', JSON.stringify({ ok: tcBadEndpointMode.ok, endpoint: tcBadEndpointMode.endpoint, error: tcBadEndpointMode.error }));
+check('runtime testConnection: unknown endpointMode draft falls back to saved (auto)', tcBadEndpointMode.ok === true && tcBadEndpointMode.via === 'models' && tcBadEndpointMode.endpoint === 'http://127.0.0.1:18996/v1/models', JSON.stringify({ ok: tcBadEndpointMode.ok, via: tcBadEndpointMode.via, endpoint: tcBadEndpointMode.endpoint, error: tcBadEndpointMode.error }));
 
 // 10g-2. adapter: sanitizeExtraHeaders on the wire — credential/protocol/
 // transport headers cannot ride through extraHeaders on either protocol
