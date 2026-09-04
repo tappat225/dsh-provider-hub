@@ -1,6 +1,6 @@
 {
   "name": "@tappat225/dsh-provider-hub",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "DSH LLM provider hub with a native model-configuration panel, gateway routes, model catalogs and live model discovery. Supports three wire protocols, custom User-Agent, model overrides and live routing without hand-editing settings.yaml.",
   "type": "module",
   "main": "lib/index.js",

@@ -64,7 +64,7 @@ dsh plugin --profile desktop add /path/to/dsh-provider-hub
 # 推送 GitHub 后（仓库须打 dsh-plugin topic）
 dsh plugin --profile web add github:tappat225/dsh-provider-hub
 # 或指定版本 tarball
-dsh plugin --profile web add https://github.com/tappat225/dsh-provider-hub/archive/refs/tags/v0.5.0.tar.gz
+dsh plugin --profile web add https://github.com/tappat225/dsh-provider-hub/archive/refs/tags/v0.6.0.tar.gz
 ```
 
 `dsh plugin add` 会把参数转发给 profile 目录里的 pnpm（需先 `npm install -g pnpm`）。
