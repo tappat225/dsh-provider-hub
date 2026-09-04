@@ -1,7 +1,7 @@
 /**
  * Provider Hub — client entry (static bundle → lib/client.js, ModuleLoader
- * format). Mounts the `providerHub` Remote namespace and registers the
- * settings page section.
+ * format). Mounts the `providerHub` Remote namespace and registers a native
+ * model-configuration panel using the DSH sidebar/shell slots.
  *
  * Every operation is defensive: the client half runs inside DSH's renderer,
  * where an uncaught error can block the startup handshake and push Desktop
@@ -14,6 +14,7 @@ import type * as ReactTypes from 'react';
 // its platform seed table, so the built bundle calls require("react") and
 // gets the renderer's React instance (no global dependency).
 import React from 'react';
+import { defineStore } from '@deepseek-ai/dsh-client-runtime/client';
 import { ProviderHubPage, css, zh, en, type Translate, type Call } from './page.tsx';
 // Strict Typert invocation descriptors for the `providerHub` Remote; the
 // client half mounts them through ctx.remote.$mount (same wire contract the
@@ -21,16 +22,11 @@ import { ProviderHubPage, css, zh, en, type Translate, type Call } from './page.
 import { INVOCATIONS } from '../host/contract.ts';
 
 export const name = 'provider-hub';
-/** Cordis service injections (official client-plugin pattern): wait for the
- *  slots (settings sections), locale and remote (Client Remote service from
- *  @deepseek-ai/dsh-api-gateway) services before activating, so
- *  `ctx.remote.$mount` is available at apply time. All three are built-in
- *  services every DSH profile provides. */
+/** Cordis service injections: sidebar/shell slots for the standalone panel,
+ * locale for dictionaries, and remote for the Provider Hub contribution. */
 export const inject: string[] = ['slots', 'locale', 'remote'];
 
 const NS = 'settings.provider-hub';
-const SLOT_ID = 'provider-hub-settings';
-const SLOT_ORDER = 30;
 const STYLE_ID = 'dsh-provider-hub-styles';
 
 /** Wire method name → Remote handle method. */
@@ -45,6 +41,7 @@ const METHOD_MAP: Record<string, string> = {
   'delete-custom': 'deleteCustom',
   'upsert-model': 'upsertModel',
   'delete-model': 'deleteModel',
+  'save-models': 'saveModels',
   'discover': 'discover',
   'test-connection': 'testConnection',
   'enable-discovered': 'enableDiscovered',
@@ -60,6 +57,7 @@ const PARAM_ORDER: Record<string, string[]> = {
   'delete-custom': ['index', 'id'],
   'upsert-model': ['index', 'entry', 'overwrite', 'clearFields'],
   'delete-model': ['index', 'id'],
+  'save-models': ['index', 'models', 'params'],
   'discover': ['index'],
   'test-connection': ['index', 'draft'],
   'enable-discovered': ['index', 'model'],
@@ -92,7 +90,7 @@ function safeTranslate(locale: unknown, ns: string): Translate {
 }
 
 /**
- * Render error boundary for the settings section. A renderer-side throw in
+ * Render error boundary for the standalone model-configuration panel. A renderer-side throw in
  * the page (e.g. a React hook-order violation) would otherwise blank the
  * whole settings panel with no feedback; this shows the message + a retry.
  * The class component only touches React, which is safe inside the renderer.
@@ -128,6 +126,87 @@ class PageBoundary extends React.Component<{ children: ReactTypes.ReactNode }, {
     }
     return this.props.children;
   }
+}
+
+function ProviderHubIcon(props: { size?: number }): ReactTypes.ReactElement {
+  const size = props.size ?? 20;
+  return React.createElement('svg', {
+    width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+    strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
+  },
+    React.createElement('rect', { x: 16, y: 16, width: 6, height: 6, rx: 1 }),
+    React.createElement('rect', { x: 2, y: 16, width: 6, height: 6, rx: 1 }),
+    React.createElement('rect', { x: 9, y: 2, width: 6, height: 6, rx: 1 }),
+    React.createElement('path', { d: 'M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3M12 12V8' }),
+  );
+}
+
+/** Community Market's first-class panel pattern: the footer-action slot
+ * supplies the launcher immediately above settings, while shell.overlay owns
+ * modal stacking, focus and escape handling without relying on Desktop DOM
+ * selectors. */
+const hubViewStore = defineStore({
+  init: () => ({ open: false }),
+  actions: {
+    open: (draft: { open: boolean }) => { draft.open = true; },
+    close: (draft: { open: boolean }) => { draft.open = false; },
+  },
+});
+
+function HubLauncher(props: { wide: boolean; useStore: (select: (state: { open: boolean }) => boolean) => boolean; actions: { open(): void }; t: Translate }): ReactTypes.ReactElement {
+  const open = props.useStore((state) => state.open);
+  return React.createElement('button', {
+    type: 'button', className: 'phub-panel-launcher', 'data-wide': props.wide,
+    'aria-label': props.t('panelTitle'), 'aria-haspopup': 'dialog', 'aria-expanded': open,
+    onClick: () => props.actions.open(),
+  },
+    React.createElement(ProviderHubIcon, { size: props.wide ? 16 : 18 }),
+    props.wide ? props.t('panelTitle') : null,
+  );
+}
+
+function HubOverlay(props: {
+  useStore: (select: (state: { open: boolean }) => boolean) => boolean;
+  actions: { close(): void };
+  t: Translate;
+  call: Call;
+}): ReactTypes.ReactElement | null {
+  const open = props.useStore((state) => state.open);
+  const panel = React.useRef<HTMLElement | null>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    panel.current?.querySelector<HTMLButtonElement>('button')?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (document.querySelectorAll('[role="dialog"]').length > 1) return;
+      props.actions.close();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [open, props.actions]);
+  if (!open) return null;
+  return React.createElement('div', {
+    className: 'phub-panel-overlay', role: 'dialog', 'aria-modal': 'true', 'aria-label': props.t('panelTitle'),
+  },
+    React.createElement('button', {
+      type: 'button', className: 'phub-panel-mask', 'aria-label': props.t('panelClose'), onClick: () => props.actions.close(),
+    }),
+    React.createElement('section', { ref: panel, className: 'phub-panel-sheet' },
+      React.createElement('header', { className: 'phub-panel-header' },
+        React.createElement('div', { className: 'phub-brand' },
+          React.createElement('span', { className: 'phub-brandMark' }, React.createElement(ProviderHubIcon, { size: 20 })),
+          React.createElement('div', null,
+            React.createElement('h1', null, props.t('panelTitle')),
+            React.createElement('p', null, props.t('panelSubtitle')),
+          ),
+        ),
+        React.createElement('button', { type: 'button', className: 'phub-iconBtn', 'aria-label': props.t('panelClose'), onClick: () => props.actions.close() }, '×'),
+      ),
+      React.createElement('div', { className: 'phub-panel-body' },
+        React.createElement(PageBoundary, null, React.createElement(ProviderHubPage, { t: props.t, call: props.call })),
+      ),
+    ),
+  );
 }
 
 export function apply(ctx: any): void {
@@ -225,22 +304,27 @@ export function apply(ctx: any): void {
       }
     };
 
-    // --- settings section slot (defensive, mirror official inject pattern) ---
     const slots = (ctx?.get ?? (() => undefined))('slots') ?? ctx?.slots;
-    if (slots === undefined || typeof slots.inject !== 'function') return;
-    try {
-      slots.inject('settings.section', () => {
-        try {
-          return slots.register(
-            { name: 'settings.section', id: SLOT_ID, order: SLOT_ORDER, label: () => t('nav') },
-            () => React.createElement(PageBoundary, null, React.createElement(ProviderHubPage, { t, call })),
-          );
-        } catch {
-          return undefined;
-        }
-      });
-    } catch {
-      // slot registration failed; nothing else to do
+    if (slots !== null && slots !== undefined && typeof slots.inject === 'function') {
+      try {
+        slots.inject('sidebar.footer.action', () => slots.register({
+          name: 'sidebar.footer.action',
+          id: 'model-config',
+          order: 10,
+          locale: NS,
+          store: hubViewStore,
+        }, HubLauncher));
+        slots.inject('shell.overlay', () => slots.register({
+          name: 'shell.overlay',
+          id: 'model-config',
+          order: 10,
+          locale: NS,
+          store: hubViewStore,
+        }, (slotProps: any) => React.createElement(HubOverlay, { ...slotProps, t, call })));
+      } catch {
+        // The standalone surface is additive; a missing shell slot must not
+        // affect the Remote service or the LLM routes.
+      }
     }
   } catch {
     // last-resort: never let the client half break the renderer

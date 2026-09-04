@@ -1,7 +1,7 @@
 {
   "name": "@tappat225/dsh-provider-hub",
   "version": "0.5.0",
-  "description": "DSH LLM provider hub: register gateway routes with their own settings panel, three wire protocols (anthropic-messages, openai-completions, openai-responses), auto/custom endpoint addressing, custom User-Agent for UA-whitelisted gateways, field-level model overrides, and live model discovery. Configure in the plugin panel — no hand-editing settings.yaml.",
+  "description": "DSH LLM provider hub with a native model-configuration panel, gateway routes, model catalogs and live model discovery. Supports three wire protocols, custom User-Agent, model overrides and live routing without hand-editing settings.yaml.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -28,14 +28,15 @@
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-api-remotes"
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-primitives"
       ]
     }
   },
   "scripts": {
     "build": "node build.mjs && tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "node test/plugin.test.mjs && node test/wire.test.mjs && node test/responses.test.mjs && node test/client-loader.test.mjs",
+    "test": "node test/plugin.test.mjs && node test/wire.test.mjs && node test/responses.test.mjs && node test/client-loader.test.mjs && node test/client-page.test.mjs",
     "check": "npm run typecheck && npm run build && npm test"
   },
   "keywords": [
@@ -57,7 +58,10 @@
     "@deepseek-ai/dsh-settings": "^0.1.0-rc",
     "@deepseek-ai/dsh-credentials": "^0.1.0-rc",
     "@deepseek-ai/dsh-launch-environment": "^0.1.0-rc",
-    "@deepseek-ai/schemastery": "^3.18.0"
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc",
+    "react": "^18.2.0"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-launch-environment": "^0.1.0-rc",

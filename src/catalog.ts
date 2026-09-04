@@ -58,17 +58,22 @@ export function gatewayModelDefaults(gw: GatewayConfig): GatewayModelDefaults {
 export const MODEL_CATALOG: Record<string, CatalogEntry> = {
   'glm-5.3': {
     name: 'GLM-5.3',
-    contextWindow: 200000,
-    maxTokens: 131072,
-    input: ['text', 'image'],
-    reasoning: { off: null, low: 'low', medium: 'medium', high: 'high' },
-  },
-  'glm-5.3-flash': {
-    name: 'GLM-5.3-Flash',
+    // Official Zhipu specs (docs.bigmodel.cn, GLM-5.3): 1M context, 128K max
+    // output; thinking always on — reasoning_effort offers low/high/max
+    // (default max) and thinking cannot be disabled, so no `off` is offered.
     contextWindow: 1000000,
     maxTokens: 131072,
     input: ['text', 'image'],
-    reasoning: { off: null, low: 'low', high: 'high', max: 'max' },
+    reasoning: { low: 'low', high: 'high', max: 'max' },
+  },
+  'glm-5.3-flash': {
+    name: 'GLM-5.3-Flash',
+    // Official Zhipu specs (docs.bigmodel.cn, GLM-5.3-Flash): 1M context,
+    // 128K max output; text parameters match GLM-5.3 (thinking always on).
+    contextWindow: 1000000,
+    maxTokens: 131072,
+    input: ['text', 'image'],
+    reasoning: { low: 'low', high: 'high', max: 'max' },
   },
   'claude-opus-4-8': {
     name: 'Claude Opus 4.8',

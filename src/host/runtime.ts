@@ -708,9 +708,135 @@ export class ProviderHubRuntime extends TypertRemoteService {
     }
   }
 
-  /** Discover models with the saved gateway configuration. */
-  async discover(index: number): Promise<Envelope> {
+  /**
+   * Whole-list model save for ONE gateway (cc-switch-style editor): the model
+   * LIST (id + display name rows) is the source of truth for WHICH models
+   * exist, and `params` carries the detailed per-id groups from the page's
+   * "config JSON" section ({ contextWindow, maxTokens, input,
+   * reasoningEfforts, ... }). Reconciliation per row:
+   *
+   *   - built-in catalog id: ensured in `enabledModels`; its override is
+   *     rebuilt from the group (row-managed keys name/contextWindow/maxTokens
+     *     come from the row + group, any OTHER previous override key — input,
+   *     reasoningEfforts, ... — is preserved unless the group provides it).
+   *   - any other id: a `customModels` entry rebuilt the same way; capacities
+   *     come from the group, falling back to the PREVIOUS entry's value, then
+   *     the gateway default — with none of the three the write is refused
+   *     (no silent fallback), mirroring upsertModel.
+   *   - `name` inside a group is ignored — the list row's display name wins.
+   *   - ids configured before but absent from the submitted list are dropped
+   *     from enabledModels/modelOverrides/customModels (orphan cleanup).
+   *
+   * The write is gated on resolveModelEntries (commitGateway), so an
+   * unresolvable configuration never lands. One whole-array write — this is
+   * the single-save path behind the settings page's one 保存 button.
+   */
+  async saveModels(index: number, models: unknown, params: unknown): Promise<Envelope> {
     try {
+      const st = this.settings();
+      if (st === undefined) return fail('settings service unavailable');
+      if (st.writable === false) return fail('settings are read-only');
+      const gw = this.gatewayAt(index);
+      if (gw === undefined) return fail('gateway index out of range');
+      if (!Array.isArray(models)) return fail('models must be an array');
+      if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+        return fail('params must be a JSON object');
+      }
+      const rows: Array<{ id: string; name: string }> = [];
+      const seen = new Set<string>();
+      for (const raw of models) {
+        if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+          return fail('each model row must be an object');
+        }
+        const id = typeof (raw as { id?: unknown }).id === 'string' ? ((raw as { id: string }).id).trim() : '';
+        if (id === '') return fail('every model row needs a non-empty id');
+        if (seen.has(id)) return fail(`duplicate model id "${id}"`);
+        seen.add(id);
+        const nameRaw = (raw as { name?: unknown }).name;
+        if (nameRaw !== undefined && nameRaw !== null && typeof nameRaw !== 'string') {
+          return fail(`model "${id}": name must be a string`);
+        }
+        rows.push({ id, name: typeof nameRaw === 'string' ? nameRaw.trim() : '' });
+      }
+      // Validate + normalize every non-empty group through the shared entry
+      // validator (positive-integer capacities, filtered input, reasoning-map
+      // shape). A group's `name` is row-owned and stripped before validation.
+      const normalized: Record<string, Record<string, unknown>> = {};
+      for (const [id, group] of Object.entries(params as Record<string, unknown>)) {
+        if (group === undefined || group === null) continue;
+        if (typeof group !== 'object' || Array.isArray(group)) return fail(`params.${id} must be a JSON object`);
+        const { name: _rowOwned, ...rest } = group as Record<string, unknown>;
+        if (Object.keys(rest).length === 0) continue;
+        try {
+          normalized[id] = validateModelEntry({ ...rest, id }).fields;
+        } catch (error) {
+          return fail(`params.${id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      const defaults = gatewayModelDefaults(gw);
+      const nextEnabled: string[] = [];
+      const nextOverrides: Record<string, Record<string, unknown>> = {};
+      const nextCustom: Array<Record<string, unknown>> = [];
+      for (const row of rows) {
+        const group = normalized[row.id] ?? {};
+        const prevSource: Record<string, unknown> | undefined = MODEL_CATALOG[row.id] !== undefined
+          ? (gw.modelOverrides ?? {})[row.id] as Record<string, unknown> | undefined
+          : (gw.customModels ?? []).find((c) => c.id === row.id) as Record<string, unknown> | undefined;
+        // Unmanaged = every key the row/group does not own (input,
+        // reasoningEfforts, ...) from the previously stored entry/override.
+        const unmanaged: Record<string, unknown> = {};
+        if (prevSource !== null && typeof prevSource === 'object') {
+          for (const [key, value] of Object.entries(prevSource)) {
+            if (key !== 'id' && key !== 'name' && key !== 'contextWindow' && key !== 'maxTokens') unmanaged[key] = value;
+          }
+        }
+        const built: Record<string, unknown> = { ...unmanaged, ...group };
+        if (row.name !== '') built.name = row.name;
+        if (MODEL_CATALOG[row.id] !== undefined) {
+          if (group.reasoningEfforts === false) {
+            return fail(`built-in model "${row.id}" cannot declare reasoningEfforts: false; remove the key to inherit the catalog's reasoning map`);
+          }
+          nextEnabled.push(row.id);
+          if (Object.keys(built).length > 0) nextOverrides[row.id] = built;
+        } else {
+          // Custom capacities: the group wins; when it omits a capacity the
+          // PREVIOUS entry's value is kept (the same edit semantics as
+          // upsertModel), then the gateway default, then the write is refused.
+          for (const key of ['contextWindow', 'maxTokens'] as const) {
+            if (positiveInt(built[key])) continue;
+            const prevValue = prevSource?.[key];
+            if (positiveInt(prevValue)) {
+              built[key] = prevValue;
+              continue;
+            }
+            if (defaults[key] !== undefined) {
+              delete built[key];
+              continue;
+            }
+            return fail(`custom model "${row.id}" needs a positive integer ${key} (provide it in the gateway's config JSON, or set the gateway's default${key === 'contextWindow' ? 'ContextWindow' : 'MaxTokens'})`);
+          }
+          // A `false` reasoningEfforts declares a non-reasoning model: with no
+          // map stored, resolution serves no reasoning control. Drop the
+          // marker so the stored entry carries NO map (upsertModel semantics).
+          if (built.reasoningEfforts === false) delete built.reasoningEfforts;
+          built.id = row.id;
+          nextCustom.push(built);
+        }
+      }
+      const next: GatewayConfig = {
+        ...gw,
+        enabledModels: nextEnabled,
+        modelOverrides: nextOverrides,
+        customModels: nextCustom as unknown as typeof gw.customModels,
+      };
+      return await this.commitGateway(st, index, next);
+    } catch (error) {
+      return fail(error);
+    }
+  }
+
+  /** Discover models with the saved gateway configuration. */
+  async discover(index: number): Promise<Envelope> {    try {
       const gw = this.gatewayAt(index);
       if (gw === undefined) return fail('gateway index out of range');
       const models: LlmDiscoveredModel[] = await discoverModels({}, gw, () => this.deps.resolveApiKey(gw));

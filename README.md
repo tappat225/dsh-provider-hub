@@ -1,6 +1,6 @@
 # dsh-provider-hub
 
-DSH LLM **provider 中枢插件**：在 DSH 的插件配置栏里配置**任意多个网关**（每个网关是一个 OpenAI / Anthropic 兼容端点，独立协议、独立 UA、独立 key、独立模型目录），启用内置的主流模型目录后，模型直接出现在 DSH 的模型选择器里——**不需要手写 `settings.yaml` 的 `llm-pi-ai.providers`**。
+DSH LLM **provider 中枢插件**：通过 DSH 左侧栏设置按钮上方的 **Provider Hub** 独立面板（卡片式控制台）配置**任意多个网关**（每个网关是一个 OpenAI / Anthropic 兼容端点，独立协议、独立 UA、独立 key、独立模型目录），启用内置的主流模型目录后，模型直接出现在 DSH 的模型选择器里——**不需要手写 `settings.yaml` 的 `llm-pi-ai.providers`**。
 
 针对按 User-Agent 白名单校验客户端的网关：插件发出的请求携带每个网关完全自定义的 UA，绕开 DSH 强制的 `deepseek-harness/<version>` 归因头（该头在 `llm-pi-ai` 配置里是保留字段，无法覆盖）。多网关各自携带各自 UA，可同时接入多个 UA 白名单网关。
 
@@ -25,10 +25,10 @@ src/
 │   ├── contract.ts   # Typert wire 契约（INVOCATIONS / TYPERT_MANIFEST，host+client 共享）
 │   └── runtime.ts    # ProviderHubRuntime（Remote 服务：配置读写/模型管理/发现）
 ├── client/
-│   ├── static.tsx    # client 入口：挂载 Remote 命名空间 + 注册设置页插槽
-│   ├── page.tsx      # 「Provider Hub」设置页组件（网关配置 + 模型管理）
-│   ├── locales.ts    # 中/英词典
-│   └── page.css.ts   # 页面样式
+│   ├── static.tsx      # client 入口：挂载 Remote 命名空间 + 注册“Provider Hub”左侧面板与 shell overlay
+│   ├── page.tsx        # 「Provider Hub」面板内容（卡片式网格 + cc-switch 风格编辑器：请求头行 / 模型行+目录联想下拉 / 配置 JSON 常驻参数框架双向同步）
+│   ├── locales.ts      # 中/英词典
+│   └── page.css.ts     # 卡片式控制台样式（品牌 hero / 分段页签 / 卡片网格 / 双列表单，--dsw-alias-* tokens）
 └── wire/
     ├── sse.ts         # 通用 SSE 解析器
     ├── anthropic.ts   # Anthropic 消息/工具转换 + SSE -> StreamChunk
@@ -41,8 +41,8 @@ src/
 
 | 能力 | 机制 |
 |---|---|
-| 插件配置栏 | `Config` schemastery schema → DSH 插件设置页自动渲染表单（多网关列表） |
-| 配置持久化/热更新 | `installSettingsSection(ctx, 'llm-provider-hub', ...)` → settings 命名空间 |
+| Provider Hub 面板 | 参考内置 `dsh-community-market`：`sidebar.footer.action` 注册设置按钮上方入口，`shell.overlay` 注册独立模态面板；面板为卡片式控制台（品牌 hero 状态卡、提供方/模型目录分段页签、响应式卡片网格、双列表单内联编辑器）；网关数据仍通过 `providerHub` Remote 读写 |
+| 配置持久化/热更新 | `llm-provider-hub` settings 命名空间 → Host Remote 与 LLM 路由实时同步 |
 | Models 页卡片 | `ctx.llm.registerConfigurableProviders([...])`（每网关一张卡片） |
 | 模型进选择器 | `ctx.llm.registerAdapter(providers, adapter)` 一次注册全部网关路由（adapter 按 `options.provider` 选路） |
 | 一键发现模型 | `ctx.llm.registerModelDiscovery(NS, discover)`：带自定义 UA 请求 `GET {baseURL}/models`，解析 `context_window`/`max_output_tokens` 等（按网关） |
@@ -63,11 +63,11 @@ dsh plugin --profile web add https://github.com/tappat225/dsh-provider-hub/archi
 ```
 
 `dsh plugin add` 会把参数转发给 profile 目录里的 pnpm（需先 `npm install -g pnpm`）。
-包的 `dsh.bundle.patch` + `cordis.patch.yml` 会让加载器自动挂载插件，重启后即出现在插件设置页。
+包的 `dsh.bundle.patch` + `cordis.patch.yml` 会让加载器自动挂载插件；重启并刷新 DSH Web 后，左侧栏的设置按钮上方会出现入口 **Provider Hub**。
 
 npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其他同名项目冲突；`npm pack` 产物相应为 `tappat225-dsh-provider-hub-<版本>.tgz`）。正式发布渠道为 GitHub tag；若发布 npm，需 scope 所有者账号 + `--access public`。
 
-> **从旧包名 `dsh-provider-hub` 升级**：包名已 scoped，旧安装不会自动迁移——重新执行 `dsh plugin --profile <profile> add`（或把 profile `package.json` 里 bundles/dependencies 的旧条目替换为 `@tappat225/dsh-provider-hub` 后 `pnpm install`），再重启。插件设置（命名空间 `llm-provider-hub`）与网关配置不受影响。
+> **从旧包名 `dsh-provider-hub` 升级**：包名已 scoped，旧安装不会自动迁移——重新执行 `dsh plugin --profile <profile> add`（或把 profile `package.json` 里 bundles/dependencies 的旧条目替换为 `@tappat225/dsh-provider-hub` 后 `pnpm install`），再重启。后台配置（命名空间 `llm-provider-hub`）与网关配置不受影响。
 
 ### 方式二：手动 bundle（pnpm workspace）
 
@@ -82,13 +82,15 @@ npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其
 
    在 `~/.dsh/profiles/desktop` 下 `pnpm install`，重启 DSH Desktop。
 
-2. 打开 **插件设置页** 找到 `provider-hub`：填 `baseURL`、API key（`apiKey` 直接填，或 `apiKeyEnv` 指向环境变量）、勾选要启用的模型（`enabledModels`），必要时 `extraHeaders`。
+2. 打开左侧栏设置按钮上方的 **Provider Hub** 面板：hero 卡的“添加提供方”（或网格末尾的虚线卡）新建提供方，点卡片上的“编辑”展开配置页。配置页为 cc-switch 风格：基础字段（Base URL / 协议 / 端点模式 / User-Agent / API Key / Key 环境变量）→ **请求头** 键值行（添加请求头 / 行内删除）→ **模型配置** 简表（每行 模型 ID + 显示名称；“拉取模型列表”从上游 `/models` 拉取后点选即加入列表，“添加模型”手动加行）→ **配置 JSON** 详细参数页 → 页尾唯一的 **保存**。
+   **模型 ID 联想（点选才套用）**：在模型 ID 输入框打字，从**第一个字符**起出现内置目录联想下拉（前缀匹配优先、包含匹配次之，同时匹配显示名；↑↓ 高亮、Enter 选中、Esc 关闭）。**只有点选下拉条目（或 ↑↓+Enter）才写入完整的目录参数**（contextWindow / maxTokens / input / reasoningEfforts 显式展开，可直接修改）——哪怕手动输完整个目录模型名，也不会自动填参，仅预留全字段参数框架。
+   **配置 JSON = 常驻完整参数框架 + 独立编辑面**：每个模型组始终保留完整字段框架 `name` / `contextWindow` / `maxTokens` / `input` / `reasoningEfforts`，`null` = 未设置（内置模型保存时继承目录值；自定义模型需填 contextWindow 与 maxTokens，除非网关配置了 `defaultContextWindow` / `defaultMaxTokens`）。列表与 JSON **双向同步**：列表增删改行会迁移 JSON 组；在 JSON 中**手写新组即新增模型**（组内 `name` 即显示名）、**删除组即删除模型**——完全可以不碰模型列表，直接在 JSON 里逐项填参。JSON 文本无效时锁定列表编辑（不覆盖正在编辑的文本），修正后自动解锁。一次保存同时提交基础字段（save-config）与整份模型列表+参数（save-models，写前经模型解析校验）。
 
-3. （可选）在 Models 页该 provider 卡片上点"发现模型"，从网关 `/models` 拉取并采纳。
+3. （可选）点提供方卡片上的“测试连接”直接探测上游 `/models`；在 Models 页该 provider 卡片上点"发现模型"，从网关 `/models` 拉取并采纳。
 
 4. 在模型选择器里切到该 provider 下的模型即可使用。
 
-## 配置项（插件面板）
+## 配置项（后台 settings namespace）
 
 配置是一个**网关列表**（`gateways`），每个网关独立一套下列字段：
 
@@ -98,9 +100,9 @@ npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其
 | `displayName` | `Gateway` | 选择器显示名 |
 | `baseURL` | 空（必填） | 上游地址 |
 | `api` | `anthropic-messages` | 或 `openai-completions`（后者按模型 `reasoningEfforts` 映射派发 `reasoning_effort`，语义见「思考强度派发」） |
-| `userAgent` | `claude-cli/2.0.1 (external, cli)` | wire UA（可完全自定义，每网关独立；留空自动回退默认值，设置页内置常见客户端 UA 预设一键填写） |
+| `userAgent` | `claude-cli/2.0.1 (external, cli)` | wire UA（可完全自定义，每网关独立；留空自动回退默认值，面板内置常见客户端 UA 预设一键填写） |
 | `apiKeyEnv` | `GATEWAY_API_KEY` | credential-ref 环境变量名 |
-| `apiKey` | 空 | 字面量 key，优先于 apiKeyEnv（设置页默认掩码显示，可切换明文） |
+| `apiKey` | 空 | 字面量 key，优先于 apiKeyEnv（面板默认掩码显示，可切换明文） |
 | `extraHeaders` | `{}` | 附加请求头 |
 | `systemRole` | `system` | OpenAI 路径系统提示词角色；`developer` 可修复只认 developer 角色的严格网关（GPT 系） |
 | `enabledModels` | `["glm-5.3"]` | 从内置目录勾选 |
@@ -109,7 +111,7 @@ npm 包名为 **`@tappat225/dsh-provider-hub`**（用户名 scope，避免与其
 
 ## 内置模型目录（MODEL_CATALOG）
 
-GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5 / GPT-5.6 Sol·Luna·Terra / GPT-4o·4o-mini / Qwen3.8-Max·27B / DeepSeek V3·R1·V4 Flash / Kimi K2 / ——含 contextWindow、maxTokens、模态与 reasoningEfforts（推理模型 `off` 到 `max`；GPT-4o·4o-mini·DeepSeek V3 为非推理模型，无映射）。参数为公开规格，网关实际能力以"发现模型"结果为准。
+GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5 / GPT-5.6 Sol·Luna·Terra / GPT-4o·4o-mini / Qwen3.8-Max·27B / DeepSeek V3·R1·V4 Flash / Kimi K2 / ——含 contextWindow、maxTokens、模态与 reasoningEfforts（GLM-5.3·Flash 按官方规格为 1M 上下文 / 128K 输出，思考始终启用故仅提供 `low`/`high`/`max`；其余推理模型 `off` 到 `max`；GPT-4o·4o-mini·DeepSeek V3 为非推理模型，无映射）。参数为公开规格，网关实际能力以"发现模型"结果为准。
 
 ## 思考强度派发（reasoningEfforts）
 
@@ -122,11 +124,12 @@ GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5
 - 校验在模型解析期进行（fail-loud）：非 off 空值 / 空字符串 / 仅含 off 的映射都以带网关+模型+档位名的诊断拒绝。
 - Anthropic 路径：选中非 `off` 档位时，适配器自动按原生 Anthropic `thinking` 预算派发；`off` 不发送 `thinking`。
 - `modelOverrides` 的 `reasoningEfforts` 整体替换内置映射（字典无删除语义；留空 `{}` 视为未设置，保留内置映射）。
-- 设置页暂无该映射的编辑入口，需在 settings.yaml 中手改。
+- 模型配置面板可在**配置 JSON** 中按模型 id 编辑 `reasoningEfforts`（组内写该字段即生效，未写保留原值）；删除该字段则回落内置映射。
 
 ## 验证
 
 - 单测（`test/plugin.test.mjs`，全过）：Config schema（多网关）、多网关注册（`registerConfigurableProviders`/`registerAdapter` 各 2 路由）、网关隔离（`listModels` A 不含 B 的模型）、内置+自定义模型解析、`listModels`/`resolveModel`（含 UNKNOWN_MODEL 拒绝）、`prepareCall`、两种协议的 SSE→chunk 转换（文本、流式 tool_use、流式 tool_calls、reasoning_content）、模型发现字段映射、思考强度派发（wire 拼写、off 显式关闭、未声明/未映射档位请求前拒绝、map 校验、lone-off 清理）、runtime 按网关 index 的增删改/provider 改名实时生效（重名/空名拒绝）/自定义。
+- 渲染冒烟（`test/client-page.test.mjs`，全过）：面板结构（hero/页签/卡片/编辑器）与模型列表 ⇄ 配置 JSON 双向契约——常驻完整参数框架（null=未设置、目录值不泄漏）、手动输完整目录 id 不自动填参、点选下拉/↑↓+Enter 才套用预设、JSON 手写组重建列表行、无效 JSON 锁定列表编辑。
 - live（假 key）：对按 UA 白名单校验的网关，自定义 UA 生效（UA 关通过、key 关拒绝）；配真 key 即可用。
 
 ## 限制
@@ -134,4 +137,4 @@ GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8 / Claude Sonnet 4.6 / Claude Haiku 4.5
 - `anthropic-messages` 路径会根据模型选择的 reasoning 档位自动处理原生 `thinking`；无需单独配置开关。
 - `openai-completions` 路径按 `reasoningEfforts` 映射派发 `reasoning_effort`（语义见「思考强度派发」；未声明档位请求前拒绝，不做网关侧猜测）。
 - 模型发现拉取的 `/models` 若网关也做 UA 校验，插件已带自定义 UA，可正常访问。
-- 网关路由名改动实时生效（保存时立即重新注册路由）；多网关路由名不能重复（设置页会自动生成去重名，重名保存被拒绝）。
+- 网关路由名改动实时生效（面板保存时立即重新注册路由）；多网关路由名不能重复（面板会自动生成去重名，重名保存被拒绝）。

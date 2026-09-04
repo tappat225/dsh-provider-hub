@@ -433,8 +433,13 @@ const thinkAdapter = new (Object.getPrototypeOf(adapter).constructor)({
 });
 for await (const _c of thinkAdapter.stream({ provider: 'think-gw', model: 'glm-5.3', maxTokens: 32, reasoningEffort: 'high', messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
 check('anthropic thinking: high -> budget 8192, max_tokens lifted to budget+1024', lastBody.includes('"thinking":{"type":"enabled","budget_tokens":8192}') && lastBody.includes('"max_tokens":9216'), lastBody.slice(0, 200));
-for await (const _c of thinkAdapter.stream({ provider: 'think-gw', model: 'glm-5.3', maxTokens: 32, reasoningEffort: 'off', messages: [{ role: 'user', content: 'hi' }] })) { /* drain */ }
-check('anthropic thinking: off sends no thinking field', !lastBody.includes('"thinking"'), lastBody.slice(0, 200));
+const beforeThinkOff = requestCount;
+let thinkLast;
+for await (const _c of thinkAdapter.stream({ provider: 'think-gw', model: 'glm-5.3', maxTokens: 32, reasoningEffort: 'off', messages: [{ role: 'user', content: 'hi' }] })) thinkLast = _c;
+check('anthropic thinking: GLM-5.3 no longer offers off (always-on thinking, refused before I/O)', thinkLast?.reason?.kind === 'error'
+  && thinkLast?.reason?.failure?.code === 'UNSUPPORTED_REASONING_EFFORT'
+  && /does not support reasoning effort "off"/.test(thinkLast?.reason?.failure?.message ?? '')
+  && requestCount === beforeThinkOff, JSON.stringify(thinkLast?.reason));
 const beforeTurbo = requestCount;
 const turboChunks = [];
 for await (const c of thinkAdapter.stream({ provider: 'think-gw', model: 'turbo-model', maxTokens: 32, reasoningEffort: 'turbo', messages: [{ role: 'user', content: 'hi' }] })) turboChunks.push(c);
@@ -783,6 +788,72 @@ const toggleUnknown = await runtime.toggleBuiltin(0, 'retired-legacy-model', tru
 check('setup: unknown id enabled via legacy toggleBuiltin (read-side compat kept)', toggleUnknown.ok === true && stored.gateways[0].enabledModels.includes('retired-legacy-model'));
 const delOrphan = await runtime.deleteModel(0, 'retired-legacy-model');
 check('deleteModel legacy unknown id: cleaned from enabledModels (orphan path)', delOrphan.ok === true && delOrphan.kind === 'orphan' && !stored.gateways[0].enabledModels.includes('retired-legacy-model'), String(delOrphan.error));
+
+// 9d. Whole-list model save (save-models): the LIST is the source of truth,
+// the params groups ride along; this backs the cc-switch-style single-保存
+// editor. State at this point: enabledModels [glm-5.3, claude-opus-4-8,
+// deepseek-v3], overrides {glm-5.3: {contextWindow: 999999}}, customModels [].
+const smState = () => stored.gateways[0];
+const sm1 = await runtime.saveModels(0, [
+  { id: 'glm-5.3', name: 'GLM via list' },
+  { id: 'deepseek-v3' },
+  { id: 'claude-opus-4-8' },
+  { id: 'cc-custom', name: 'CC Custom' },
+], {
+  'glm-5.3': { contextWindow: 200000 },
+  'cc-custom': { contextWindow: 64000, maxTokens: 4096 },
+});
+check('saveModels: list replace ok + resolved models ride the envelope', sm1.ok === true && Array.isArray(sm1.models) && sm1.models.some((m) => m.id === 'cc-custom'), JSON.stringify({ ok: sm1.ok, error: sm1.error }));
+check('saveModels: builtin rows land in enabledModels (list order)', JSON.stringify(smState().enabledModels) === JSON.stringify(['glm-5.3', 'deepseek-v3', 'claude-opus-4-8']), JSON.stringify(smState().enabledModels));
+check('saveModels: builtin group rebuilt + row name wins', smState().modelOverrides['glm-5.3']?.contextWindow === 200000 && smState().modelOverrides['glm-5.3']?.name === 'GLM via list', JSON.stringify(smState().modelOverrides));
+check('saveModels: builtin row without a group keeps only unmanaged override keys', smState().modelOverrides['deepseek-v3']?.reasoningEfforts?.low === 'low'
+  && smState().modelOverrides['deepseek-v3']?.name === undefined && smState().modelOverrides['deepseek-v3']?.maxTokens === undefined, JSON.stringify(smState().modelOverrides));
+check('saveModels: custom row becomes a customModels entry with group params', smState().customModels.some((m) => m.id === 'cc-custom' && m.name === 'CC Custom' && m.contextWindow === 64000 && m.maxTokens === 4096), JSON.stringify(smState().customModels));
+
+// 9d-2. unmanaged keys (input / reasoningEfforts) survive a group that omits them
+await runtime.saveConfig(0, { modelOverrides: { ...smState().modelOverrides, 'deepseek-v3': { input: ['image'], reasoningEfforts: { off: null, low: 'low' } } } });
+const sm2 = await runtime.saveModels(0, [
+  { id: 'glm-5.3', name: 'GLM via list' },
+  { id: 'deepseek-v3' },
+  { id: 'claude-opus-4-8' },
+  { id: 'cc-custom', name: 'CC Custom' },
+], { 'glm-5.3': { contextWindow: 250000 } });
+const sm2Ov = smState().modelOverrides;
+check('saveModels: unmanaged override keys preserved, managed keys from group', sm2.ok === true
+  && sm2Ov['deepseek-v3']?.input?.[0] === 'image' && sm2Ov['deepseek-v3']?.reasoningEfforts?.low === 'low' && sm2Ov['deepseek-v3']?.contextWindow === undefined && sm2Ov['deepseek-v3']?.name === undefined
+  && sm2Ov['glm-5.3']?.contextWindow === 250000, JSON.stringify(sm2Ov));
+
+// 9d-3. ids configured before but absent from the submitted list are dropped
+const sm3 = await runtime.saveModels(0, [{ id: 'glm-5.3', name: 'GLM via list' }], { 'glm-5.3': { contextWindow: 250000 } });
+check('saveModels: removed ids dropped from enabledModels + overrides + customModels', sm3.ok === true
+  && JSON.stringify(smState().enabledModels) === JSON.stringify(['glm-5.3'])
+  && smState().modelOverrides['deepseek-v3'] === undefined && smState().customModels.length === 0, JSON.stringify({ e: smState().enabledModels, o: smState().modelOverrides, c: smState().customModels }));
+
+// 9d-4. refusals leave the config untouched
+const smSnap = JSON.stringify(smState());
+const sm4 = await runtime.saveModels(0, [{ id: 'no-caps' }], {});
+check('saveModels: custom row without capacities refused (no silent fallback)', sm4.ok === false && /positive integer contextWindow/.test(String(sm4.error)), String(sm4.error));
+const sm5 = await runtime.saveModels(0, [{ id: 'glm-5.3' }], { 'glm-5.3': { reasoningEfforts: false } });
+check('saveModels: builtin group with reasoningEfforts=false refused', sm5.ok === false && /cannot declare reasoningEfforts: false/.test(String(sm5.error)), String(sm5.error));
+const sm6 = await runtime.saveModels(0, [{ id: 'glm-5.3' }, { id: 'glm-5.3' }], {});
+check('saveModels: duplicate row ids refused', sm6.ok === false && /duplicate model id/.test(String(sm6.error)), String(sm6.error));
+const sm7 = await runtime.saveModels(0, [{ id: '   ' }], {});
+check('saveModels: empty row id refused', sm7.ok === false && /non-empty id/.test(String(sm7.error)), String(sm7.error));
+const sm8 = await runtime.saveModels(0, [{ id: 'glm-5.3' }], { 'glm-5.3': { contextWindow: 0 } });
+check('saveModels: invalid group capacity refused with params.<id> context', sm8.ok === false && /params\.glm-5\.3/.test(String(sm8.error)) && /positive integer/.test(String(sm8.error)), String(sm8.error));
+check('saveModels: refusals left config unchanged', JSON.stringify(smState()) === smSnap);
+
+// 9d-5. custom entry with reasoningEfforts=false stores NO map; group name loses to the row name
+const sm9 = await runtime.saveModels(0, [
+  { id: 'cc-flat', name: 'Flat' },
+  { id: 'glm-5.3', name: 'RowName' },
+], {
+  'cc-flat': { contextWindow: 64000, maxTokens: 4096, reasoningEfforts: false },
+  'glm-5.3': { name: 'JsonName', contextWindow: 1000 },
+});
+check('saveModels: custom reasoningEfforts=false clears the map', sm9.ok === true
+  && smState().customModels.some((m) => m.id === 'cc-flat' && m.contextWindow === 64000 && !('reasoningEfforts' in m)), JSON.stringify(smState().customModels));
+check('saveModels: group name ignored (list row display name wins)', smState().modelOverrides['glm-5.3']?.name === 'RowName' && smState().modelOverrides['glm-5.3']?.contextWindow === 1000, JSON.stringify(smState().modelOverrides));
 
 // 7. Model discovery (echo /models) — draft request routed by baseURL.
 // The echo listing holds 3 non-empty ids with one duplicate: the count of 2

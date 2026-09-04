@@ -32,5 +32,34 @@ declare module '@deepseek-ai/dsh-client-ui-primitives' {
     className?: string;
   }
   export const Menu: FC<MenuProps>;
-  export const IconChevronDownOutline14: FC<{ size?: number; className?: string }>;
+
+  /** DSH button (variant/size/icon per the reference dsh-provider-hub usage). */
+  export interface ButtonProps {
+    variant?: 'primary' | 'outline' | 'ghost';
+    size?: 'sm' | 'md' | 'lg';
+    disabled?: boolean;
+    icon?: unknown;
+    className?: string;
+    onClick?: (event: unknown) => void;
+    'aria-label'?: string;
+    title?: string;
+    children?: unknown;
+  }
+  export const Button: FC<ButtonProps>;
+
+  /** Small rounded status badge; `active` = tinted/accent state. */
+  export const Pill: FC<{ active?: boolean; children?: unknown }>;
+
+  /** Colored status dot: done=green, ongoing=blue, warning=amber, error=red. */
+  export const StateDot: FC<{ state?: 'done' | 'error' | 'warning' | 'ongoing'; size?: number }>;
+
+  export interface IconProps {
+    size?: number;
+    className?: string;
+  }
+  export const IconChevronDownOutline14: FC<IconProps>;
+  export const IconPlusOutline16: FC<IconProps>;
+  export const IconRefreshOutline16: FC<IconProps>;
+  export const IconTrashOutline16: FC<IconProps>;
+  export const IconLoadingOutline16: FC<IconProps>;
 }
