@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本文件是本仓库（dsh-provider-hub / npm 包 `@tappat225/dsh-provider-hub`）的项目说明入口，供协作者与 AI agent 快速了解项目背景、架构与约束。用户侧文档见 [README.md](README.md)；接手开发的完整现状与交接流程见 `note/` 体系（本地私有，不入 git，见下方「记忆记录规则」与「协作须知」）。
+本文件是本仓库（dsh-provider-hub / npm 包 `@tappat225/dsh-provider-hub`）的项目说明入口，供协作者与 AI agent 快速了解项目背景、架构与约束。用户侧文档见 [README.md](README.md)；接手开发需先读 `note/memory/` 长期记忆（本地私有，不入 git，见下方「记忆记录规则」）。
 
 ## 项目是什么
 
@@ -82,12 +82,8 @@ DSH（DeepSeek Harness）LLM **provider 中枢插件**：通过 DSH 左侧栏的
 ├── lib/                          # 构建产物（esbuild 双 bundle + sourcemap），入库但绝不手改
 ├── test/                         # 离线单测：plugin / wire / responses / client-loader / client-page
 │   └── helpers/react-shim.cjs    # 渲染冒烟测试用的极简 React shim
-├── note/                         # 私有笔记体系（gitignored，本机私有，不入 git）
-│   ├── README.md                 # note 索引表 + 命名规则
-│   ├── 2026-08-28-21-52-02-HANDOFF.md    # 交接指南（§2 当前状态 / §8 下一轮起点，每轮更新）
-│   ├── 2026-08-28-21-14-49-roadmap.md    # 功能 TODO 清单（含勾选状态）
-│   ├── YYYY-MM-DD-HH-mm-ss-*.md  # 每轮工作笔记
-│   ├── archive/                  # 历史归档（只读）
+├── note/                         # 开发协作记录与历史归档（gitignored，本机私有，不入 git）
+│   ├── archive/                  # 历史归档笔记（只读不新增），见 archive/README.md
 │   └── memory/                   # AI agent 长期记忆，见下方「记忆记录规则」
 │       ├── MEMORY.md             # 任务流水账（收尾自动写入）
 │       └── KEY.md                # 已确认根因（需用户确认后写入）
@@ -110,7 +106,7 @@ DSH（DeepSeek Harness）LLM **provider 中枢插件**：通过 DSH 左侧栏的
 - MEMORY.md 是收尾动作的一部分（见上方最高优先级规则）；纯问答/无代码改动的轮次也写一行简报，保持时间线完整
 - 新条目一律**追加到文件末尾**，不改写、不删除历史条目
 - KEY.md 只收"高置信度、已验证、用户确认过"的根因，不是所有 debug 过程都升级成 KEY 条目；KEY 是 MEMORY 的精选子集，数量应远少于 MEMORY
-- debug 过程的中间记录放当轮工作笔记（`note/YYYY-MM-DD-HH-mm-ss-*.md`），不进 memory
+- **不再创建时间戳工作笔记**（`note/YYYY-MM-DD-HH-mm-ss-*.md`）；历史笔记（HANDOFF / roadmap / 各轮工作笔记）已冻结归档到 `note/archive/`（只读，仅作查阅，不新增）。所有记忆只落在下方两个文件。
 
 **MEMORY.md 格式**：
 
@@ -118,11 +114,13 @@ DSH（DeepSeek Harness）LLM **provider 中枢插件**：通过 DSH 左侧栏的
 [YYYY-MM-DD HH:MM] [git <branch>] [<可选模块标签，如 host/client/wire/catalog>] <正文，陈述做了什么/为什么/结果>
 【反馈】情绪:正面/负面 | 分类:<简短分类> | 原话:"<用户原话，仅负面或强烈反馈时记>" | 表现:<用户表现的简述>
 §
+
+[YYYY-MM-DD HH:MM] ... 下一条目
 ```
 
 - 正文一句话到几句话，是完整时间线，不追求精炼
 - `【反馈】` 整块可选，只有当用户在本次任务中表达了明显情绪（尤其负面）时才附加，用于避免后续重复触发同类不满；日常无情绪波动的任务不需要这一行
-- 条目间用 `§` 单独一行分隔
+- 条目间用 `§` 单独一行分隔，**`§` 之后再空一行**才写下一条目（即每个记忆块 = 正文 + `§` + 空行，文件末尾条目同理）
 
 **KEY.md 格式**：
 
@@ -135,7 +133,7 @@ DSH（DeepSeek Harness）LLM **provider 中枢插件**：通过 DSH 左侧栏的
 - `summary` 要能让人一眼看出"这是什么坑"，正文再展开技术细节
 - 条目间用 `§` 单独一行分隔
 
-**记忆的消费侧（开工先读）**：记忆只写不读等于没有。接手任何任务前，先读 `note/memory/KEY.md` 全文（避免重复踩已定位的坑）→ `note/memory/MEMORY.md` 最近若干条（当前进度、未推送 commit 状态）→ `note/README.md` 索引 → HANDOFF 的 §2（当前状态）/§8（下一轮起点），再动手。
+**记忆的消费侧（开工先读）**：记忆只写不读等于没有。接手任何任务前，先读 `note/memory/KEY.md` 全文（避免重复踩已定位的坑）→ `note/memory/MEMORY.md` 最近若干条（当前进度、未推送 commit 状态），再动手。历史背景如需追溯，可查 `note/archive/` 只读归档。
 
 ## 开发与验证
 
@@ -151,16 +149,16 @@ npm run check       # typecheck + build + test 一键全绿（改动的验收标
 - node 直接跑 `.ts` 靠类型剥离，字面量漏字段运行时发现不了——改完必须 `tsc --noEmit` 验证
 - esbuild 子进程在受限沙箱内可能被拦，此时改用 `node node_modules/esbuild/bin/esbuild` CLI 方式构建（历史经验见 `note/memory/`）
 - 依赖安装用 `npm install --no-save`（`node_modules/` 与 `package-lock.json` 均不入库）
-- 每次改动的验收清单：typecheck 零错误 / build 双 bundle + map 同步 / test 全绿 / locales zh-en 键成对 / roadmap 勾选与 README、HANDOFF 状态一致
+- 每次改动的验收清单：typecheck 零错误 / build 双 bundle + map 同步 / test 全绿 / locales zh-en 键成对 / README 与代码保持同步
 
 ## 协作须知
 
-- **阅读顺序**：新 agent 接手先读 本文件 → [README.md](README.md) → `note/memory/KEY.md` → `note/` 下 HANDOFF（§2 当前状态 / §8 下一轮起点）→ `note/README.md`（note 索引），再动手。
+- **阅读顺序**：新 agent 接手先读 本文件 → [README.md](README.md) → `note/memory/KEY.md` → `note/memory/MEMORY.md` 最近若干条，再动手。
 - **身份四件套硬耦合**：`package.json` name == `cordis.patch.yml` name（带引号，前导 `@` 是 YAML 保留字符）== `build.mjs` 的 CLIENT_LOADER_ID == `dsh.plugin.json` id，改包名四处一起改（`test/plugin.test.mjs` 有一致性守卫测试）；typert 贡献的 `package` 字段 = npm 包名。刻意不改：`cordis.patch.yml` 的 `id: provider-hub`（插件 fiber id）、settings 命名空间 `llm-provider-hub`、wire typeSymbol 前缀。
 - **契约三处同步**：`src/host/contract.ts` 新增/修改 remote 方法时，`METHODS` / `INVOCATIONS` / `TYPERT_MANIFEST` 三处必须同步，且 `src/host/runtime.ts` 与 `src/client/page.tsx` 同步消费。
 - **文档同步**：README.md 的配置表、内置目录、限制章节与 `src/catalog.ts`、`src/index.ts` 保持一致；`dsh.plugin.json` 版本与 `package.json` 同步。
-- **note/ 体系**：新 note 命名 `YYYY-MM-DD-HH-mm-ss-<kebab>.md`（时间戳=文件创建时刻）；修改旧 note 不改文件名；新增后同步 `note/README.md` 索引表；每轮交接后更新 HANDOFF §2/§8 与 roadmap「后续步骤」，保持"下一位 agent 打开就能接着做"。
+- **note/ 体系**：长期记忆只写 `note/memory/MEMORY.md` 与 `KEY.md`（规则见上方「记忆记录规则」，不要混用）；`note/archive/` 下既有历史记录（HANDOFF / roadmap / 各轮笔记与索引）仅作查阅，**只读不新增**。
 - **reference/ 只读**：只作对照/审计参考，不参与构建，不把其中代码连同其私有耦合拷进 `src/`。
 - **不入 git 的目录**（见 `.gitignore`）：`note/`、`temp/`、`reference/`、`node_modules/`、`.claude/`、`.agents/`——均为本机工作区内容，clone 后不存在属正常。
-- **环境事实**（DSH Desktop 安装位置、本机 profile 与插件符号链接——重启 DSH 即加载最新构建、代理细节）见 `note/` 下 HANDOFF §7（本地私有）。
-- 深层技术坑（client bundle 注册格式、remote `$mount` 范式、settings 读写范式、react-shim 单实例等）优先查 `note/memory/KEY.md`，其次 HANDOFF §6。
+- **环境事实**（DSH Desktop 安装位置、本机 profile 与插件符号链接——重启 DSH 即加载最新构建、代理细节）见 `note/archive/` 下历史 HANDOFF §7（本地私有，只读归档）。
+- 深层技术坑（client bundle 注册格式、remote `$mount` 范式、settings 读写范式、react-shim 单实例等）优先查 `note/memory/KEY.md`；历史细节可查 `note/archive/` 下 HANDOFF §6（只读）。
