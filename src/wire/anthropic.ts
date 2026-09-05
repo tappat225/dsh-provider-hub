@@ -6,7 +6,8 @@
  */
 import type { ContentBlock, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm';
 import type { AnthropicSsePayload, WireInputMessage } from '../types.ts';
-import { errorFinish, iterateSse } from './sse.ts';
+import { classifyStreamEnd, classifyTransportError } from './failure.ts';
+import { abortedFinish, errorFinish, iterateSse, providerErrorFinish } from './sse.ts';
 
 interface AnthropicTextPart { type: 'text'; text: string }
 interface AnthropicImagePart {
@@ -149,22 +150,67 @@ interface PartialBlock {
   arguments: string;
 }
 
+/** Assemble the durable block one streamed partial accumulated. */
+function blockOf(partial: PartialBlock): ContentBlock {
+  return partial.blockType === 'tool-call'
+    ? { type: 'tool-call', id: partial.toolId as never, name: partial.toolName ?? '', arguments: partial.arguments }
+    : partial.blockType === 'reasoning'
+      ? { type: 'reasoning', text: partial.text }
+      : { type: 'text', text: partial.text };
+}
+
 /**
  * Convert an Anthropic SSE response into the DSH StreamChunk protocol.
  * Text / thinking / streaming tool_use blocks are all supported; the stream
  * always terminates with a `finish` chunk (stop / max-tokens / error / aborted).
+ *
+ * The terminal chunk is always CLASSIFIED (see ./failure.ts), because the host's
+ * retry executor routes on the failure code alone: an in-stream error event, a
+ * torn read, a stream that never reached `message_stop`/a `stop_reason` (a
+ * truncated reply must not be presented as complete) and a message that
+ * carried no output at all are failures with a routing code, not a silent
+ * `stop`. Caller cancellation stays an `aborted` finish.
  */
 export async function* anthropicSseToChunks(response: Response, signal?: AbortSignal): AsyncGenerator<StreamChunk> {
   const partials = new Map<number, PartialBlock>();
-  let sawStop = false;
+  /** The protocol's own terminal marker arrived (`message_stop` / a stop_reason). */
+  let sawTerminal = false;
+  /** `message_delta` reported the output cap: complete as far as allowed. */
+  let sawMaxTokens = false;
+  /** Durable output actually streamed (a block start alone does not count). */
+  let sawContent = false;
+
+  /**
+   * Close every block still open, in index order. Emitted before ANY terminal
+   * chunk, so a failure never discards the deltas already delivered above.
+   */
+  const closeBlocks = (): StreamChunk[] => {
+    const closes: StreamChunk[] = [];
+    for (const [index, partial] of [...partials.entries()].sort((a, b) => a[0] - b[0])) {
+      closes.push({ type: 'block-end', index, block: blockOf(partial) });
+      partials.delete(index);
+    }
+    return closes;
+  };
+
   try {
     for await (const sse of iterateSse(response, signal)) {
       if (sse.event === 'error') {
-        yield errorFinish(sse.data);
+        yield* closeBlocks();
+        yield providerErrorFinish(sse.data);
         return;
       }
-      let payload: AnthropicSsePayload;
-      try { payload = JSON.parse(sse.data) as AnthropicSsePayload; } catch { continue; }
+      let parsed: unknown;
+      try { parsed = JSON.parse(sse.data); } catch { continue; }
+      if (parsed === null || typeof parsed !== 'object') continue;
+      // A gateway that omits the `event:` field name still reports the same
+      // failure inside the data payload.
+      if ((parsed as { type?: unknown }).type === 'error') {
+        yield* closeBlocks();
+        yield providerErrorFinish(sse.data);
+        return;
+      }
+      const payload = parsed as AnthropicSsePayload;
       switch (payload.type) {
         case 'content_block_start': {
           const index = payload.index;
@@ -176,6 +222,8 @@ export async function* anthropicSseToChunks(response: Response, signal?: AbortSi
               toolName: payload.content_block.name,
               arguments: '',
             });
+            // A tool call is durable output even before its arguments stream.
+            sawContent = true;
             yield { type: 'block-start', index, blockType: 'tool-call' };
           } else if (payload.content_block.type === 'text') {
             partials.set(index, { blockType: 'text', text: '', arguments: '' });
@@ -192,12 +240,15 @@ export async function* anthropicSseToChunks(response: Response, signal?: AbortSi
           if (partial === undefined) break;
           if (payload.delta.type === 'text_delta' && payload.delta.text !== undefined) {
             partial.text += payload.delta.text;
+            if (payload.delta.text !== '') sawContent = true;
             yield { type: 'text-delta', index, text: payload.delta.text };
           } else if (payload.delta.type === 'thinking_delta' && payload.delta.thinking !== undefined) {
             partial.text += payload.delta.thinking;
+            if (payload.delta.thinking !== '') sawContent = true;
             yield { type: 'reasoning-delta', index, text: payload.delta.thinking };
           } else if (payload.delta.type === 'input_json_delta' && payload.delta.partial_json !== undefined) {
             partial.arguments += payload.delta.partial_json;
+            if (payload.delta.partial_json !== '') sawContent = true;
             yield {
               type: 'tool-call-delta',
               index,
@@ -212,12 +263,7 @@ export async function* anthropicSseToChunks(response: Response, signal?: AbortSi
           const index = payload.index;
           const partial = partials.get(index);
           if (partial === undefined) break;
-          const block: ContentBlock = partial.blockType === 'tool-call'
-            ? { type: 'tool-call', id: partial.toolId as never, name: partial.toolName ?? '', arguments: partial.arguments }
-            : partial.blockType === 'reasoning'
-              ? { type: 'reasoning', text: partial.text }
-              : { type: 'text', text: partial.text };
-          yield { type: 'block-end', index, block };
+          yield { type: 'block-end', index, block: blockOf(partial) };
           partials.delete(index);
           break;
         }
@@ -233,26 +279,38 @@ export async function* anthropicSseToChunks(response: Response, signal?: AbortSi
               },
             };
           }
-          if (payload.delta?.stop_reason === 'max_tokens') {
-            yield { type: 'finish', reason: { kind: 'max-tokens' } };
-            sawStop = true;
-            return;
+          const stopReason = payload.delta?.stop_reason;
+          if (typeof stopReason === 'string' && stopReason !== '') {
+            sawTerminal = true;
+            if (stopReason === 'max_tokens') sawMaxTokens = true;
           }
           break;
         }
         case 'message_stop': {
-          yield { type: 'finish', reason: { kind: 'stop' } };
-          sawStop = true;
-          return;
+          sawTerminal = true;
+          break;
         }
         default:
           break;
       }
+      if (sawTerminal) break;
     }
   } catch (error) {
-    if (signal?.aborted) yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted' } } };
-    else yield errorFinish(error instanceof Error ? error.message : String(error));
+    // A caller cancellation is not a failure: no retry policy may act on it.
+    if (signal?.aborted) {
+      yield abortedFinish();
+      return;
+    }
+    const classified = classifyTransportError(error);
+    yield* closeBlocks();
+    yield errorFinish(classified.message, classified.code);
     return;
   }
-  if (!sawStop) yield { type: 'finish', reason: { kind: 'stop' } };
+  yield* closeBlocks();
+  const endFailure = classifyStreamEnd(sawTerminal, sawContent);
+  if (endFailure !== undefined) {
+    yield errorFinish(endFailure.message, endFailure.code);
+    return;
+  }
+  yield { type: 'finish', reason: sawMaxTokens ? { kind: 'max-tokens' } : { kind: 'stop' } };
 }

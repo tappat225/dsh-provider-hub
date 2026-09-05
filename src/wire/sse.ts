@@ -5,6 +5,14 @@
  * @module dsh-provider-hub/wire/sse
  */
 import type { StreamChunk } from '@deepseek-ai/dsh-llm';
+import type { ProviderErrorPayload } from '../types.ts';
+import {
+  ABORTED_CODE,
+  UPSTREAM_ERROR_CODE,
+  classifyProviderError,
+  classifyProviderErrorPayload,
+  type FailureFacts,
+} from './failure.ts';
 
 /** One parsed SSE record. */
 export interface SseRecord {
@@ -96,10 +104,52 @@ export async function* iterateSse(response: Response, signal?: AbortSignal): Asy
   }
 }
 
-/** Terminal error finish chunk carrying a readable message. */
-export function errorFinish(message: string, code = 'UPSTREAM_ERROR'): StreamChunk {
+/**
+ * Terminal error finish chunk.
+ *
+ * `code` is the failure's ROUTING identity, not decoration: the host's retry
+ * executor re-attempts the step only when the code is a member of the route
+ * policy's retryable set (EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT /
+ * TRANSPORT by default). Classify with `./failure.ts` rather than passing a
+ * blanket code, or a transient upstream failure ends the turn instead of being
+ * retried. The blanket default stays for genuinely unclassifiable upstreams.
+ *
+ * `facts` carries the structured provider details (HTTP status, a capped
+ * Retry-After delay) the executor and the failure surface can use.
+ */
+export function errorFinish(message: string, code = UPSTREAM_ERROR_CODE, facts: FailureFacts = {}): StreamChunk {
   return {
     type: 'finish',
-    reason: { kind: 'error', failure: { code, message } },
+    reason: { kind: 'error', failure: { code, message, ...facts } },
   };
+}
+
+/**
+ * Terminal aborted finish chunk for a CALLER cancellation. Reported distinctly
+ * from an error because it is not a failure: the user stopped the request, and
+ * no retry policy may act on it.
+ */
+export function abortedFinish(message = 'aborted'): StreamChunk {
+  return {
+    type: 'finish',
+    reason: { kind: 'aborted', failure: { code: ABORTED_CODE, message } },
+  };
+}
+
+/**
+ * Terminal error finish for a failure the upstream reported INSIDE the
+ * response stream. `raw` is the unparsed event data: JSON when the gateway
+ * follows its protocol's error shape, plain text when it streams a bare
+ * message instead. Both are read for the failure message and classified, so a
+ * transient in-stream relay failure is retried rather than ending the turn.
+ */
+export function providerErrorFinish(raw: string): StreamChunk {
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { parsed = undefined; }
+  if (parsed !== null && typeof parsed === 'object') {
+    const classified = classifyProviderErrorPayload(parsed as ProviderErrorPayload, raw);
+    return errorFinish(classified.message, classified.code);
+  }
+  const message = raw === '' ? 'the upstream reported an error inside the response stream' : raw;
+  return errorFinish(message, classifyProviderError(undefined, message).code);
 }

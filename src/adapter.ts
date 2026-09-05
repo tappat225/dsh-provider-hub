@@ -20,6 +20,7 @@
 import {
   LlmAdapter,
   LlmError,
+  isHarnessError,
   resolveRetryPolicy,
   type GenerateOptions,
   type LlmModelInfo,
@@ -29,7 +30,8 @@ import {
 import { catalogEntryFor, gatewayModelDefaults, reasoningMetadata, resolveModelEntries } from './catalog.ts';
 import { effectiveUserAgent, type GatewayConfig, type WireConfig } from './types.ts';
 import { effectiveEndpointMode, redactUrl, resolveEndpointUrl } from './url.ts';
-import { errorFinish } from './wire/sse.ts';
+import { classifyHttpStatus, classifyTransportError, parseRetryAfterMs } from './wire/failure.ts';
+import { abortedFinish, errorFinish } from './wire/sse.ts';
 import { anthropicSseToChunks, toAnthropicMessages, toAnthropicTools } from './wire/anthropic.ts';
 import { openaiCompletionsToChunks, toOpenAIMessages, toOpenAITools } from './wire/openai.ts';
 import { responsesSseToChunks, toResponsesInput, toResponsesTools } from './wire/responses.ts';
@@ -103,6 +105,12 @@ export class GatewayAdapter extends LlmAdapter {
   }
 
   providerRetryPolicy() {
+    // The host's default `normal` policy (5 retries, 500ms -> 10s exponential
+    // backoff, provider Retry-After honored, transient codes only). Declaring
+    // it is only HALF the mechanism: the executor retries a failure solely on
+    // its `code`, so the wire layer must classify transient conditions into
+    // the retryable set (see ./wire/failure.ts). Unclassified failures keep a
+    // non-retryable code and end the turn.
     return resolveRetryPolicy(undefined, 'llm-provider-hub retryPolicy');
   }
 
@@ -247,7 +255,13 @@ export class GatewayAdapter extends LlmAdapter {
     try {
       apiKey = await this.deps.resolveApiKey(gw);
     } catch (error) {
-      yield errorFinish(error instanceof Error ? error.message : String(error));
+      // Credential faults carry their own code (MISSING_CREDENTIAL /
+      // INVALID_CREDENTIAL); both are non-retryable by design — the same
+      // credential fails identically on every attempt — but the honest code
+      // tells the failure surface which fix applies.
+      yield isHarnessError(error)
+        ? errorFinish(error.message, error.code)
+        : errorFinish(error instanceof Error ? error.message : String(error));
       return;
     }
     // Sanitize extraHeaders FIRST (case-insensitive, shared with discovery):
@@ -349,7 +363,7 @@ export class GatewayAdapter extends LlmAdapter {
       'anthropic-version': '2023-06-01',
     }, body, options.signal, apiKey);
     if (!posted.ok) {
-      yield errorFinish(posted.message);
+      yield posted.chunk;
       return;
     }
     yield* anthropicSseToChunks(posted.response, options.signal);
@@ -392,7 +406,7 @@ export class GatewayAdapter extends LlmAdapter {
       authorization: `Bearer ${apiKey}`,
     }, body, options.signal, apiKey);
     if (!posted.ok) {
-      yield errorFinish(posted.message);
+      yield posted.chunk;
       return;
     }
     yield* openaiCompletionsToChunks(posted.response, options.signal);
@@ -453,18 +467,27 @@ export class GatewayAdapter extends LlmAdapter {
       authorization: `Bearer ${apiKey}`,
     }, body, options.signal, apiKey);
     if (!posted.ok) {
-      yield errorFinish(posted.message);
+      yield posted.chunk;
       return;
     }
     yield* responsesSseToChunks(posted.response, options.signal);
   }
 
   /**
-   * POST one JSON body to the upstream. Transport failures surface as an
-   * error finish chunk; HTTP errors surface as an error finish chunk with the
-   * upstream status/message. `redact` (the API key) is scrubbed from any
-   * upstream-echoed text so a misconfigured gateway cannot bounce the
-   * credential back into the DSH error surface.
+   * POST one JSON body to the upstream.
+   *
+   * A failure comes back as the terminal chunk to yield, already CLASSIFIED
+   * (see ./wire/failure.ts): the host's retry executor routes purely on the
+   * failure code, so a transport error becomes TRANSPORT/TIMEOUT, a 429
+   * becomes RATE_LIMIT (with a capped Retry-After), a 5xx becomes SERVER, and
+   * a rejected credential becomes AUTH — the transient ones get re-attempted,
+   * the deterministic ones end the turn with an honest reason. A caller
+   * cancellation is an `aborted` finish, never an error: it is not a failure
+   * and no policy may act on it.
+   *
+   * `redact` (the API key) is scrubbed from any upstream-echoed text so a
+   * misconfigured gateway cannot bounce the credential back into the DSH error
+   * surface.
    */
   private async post(
     url: string,
@@ -472,7 +495,7 @@ export class GatewayAdapter extends LlmAdapter {
     body: unknown,
     signal?: AbortSignal,
     redact?: string,
-  ): Promise<{ ok: true; response: Response } | { ok: false; message: string }> {
+  ): Promise<{ ok: true; response: Response } | { ok: false; chunk: StreamChunk }> {
     const scrub = (text: string): string =>
       redact === undefined || redact === '' || !text.includes(redact) ? text : text.split(redact).join('***');
     let response: Response;
@@ -484,12 +507,22 @@ export class GatewayAdapter extends LlmAdapter {
         ...(signal === undefined ? {} : { signal }),
       });
     } catch (error) {
-      return { ok: false, message: `fetch failed: ${scrub(error instanceof Error ? error.message : String(error))}` };
+      if (signal?.aborted) return { ok: false, chunk: abortedFinish() };
+      const classified = classifyTransportError(error);
+      return { ok: false, chunk: errorFinish(scrub(classified.message), classified.code) };
     }
     if (!response.ok) {
       let text = await response.text().catch(() => '');
       text = scrub(text);
-      return { ok: false, message: `upstream ${response.status}: ${text.slice(0, 300)}` };
+      const detail = text.slice(0, 300);
+      const classified = classifyHttpStatus(response.status, detail, parseRetryAfterMs(response.headers.get('retry-after')));
+      return {
+        ok: false,
+        chunk: errorFinish(`upstream ${response.status}: ${detail}`, classified.code, {
+          status: response.status,
+          ...(classified.providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs: classified.providerRetryAfterMs }),
+        }),
+      };
     }
     return { ok: true, response };
   }

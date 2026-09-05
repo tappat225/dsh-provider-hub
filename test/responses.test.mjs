@@ -162,18 +162,20 @@ check('responses-tools: undefined tools -> empty list', toOpenAIResponsesTools(u
   check('responses-sse-incomplete: finish max-tokens last', chunks.at(-1)?.type === 'finish' && chunks.at(-1)?.reason?.kind === 'max-tokens', JSON.stringify(chunks.at(-1)));
 }
 
-// 7. response.failed / response.error -> error finish
+// 7. response.failed / response.error -> error finish. The upstream's native
+//    code is MAPPED onto a DSH code (the host retry executor routes on it) and
+//    kept in the message so the gateway-specific condition stays diagnosable.
 {
   const body = [eventOf('response.failed', { response: { id: 'resp_5', error: { code: 'server_error', message: 'boom' } } })].join('\n\n') + '\n\n';
   const chunks = [];
   for await (const chunk of openaiResponsesToChunks(responseOf([body]))) chunks.push(chunk);
-  check('responses-sse-failed: error finish with upstream message + code', chunks.length === 1 && chunks[0].type === 'finish' && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.message === 'boom' && chunks[0].reason?.failure?.code === 'server_error', JSON.stringify(chunks));
+  check('responses-sse-failed: SERVER code + upstream message annotated with the native code', chunks.length === 1 && chunks[0].type === 'finish' && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.message === 'boom (server_error)' && chunks[0].reason?.failure?.code === 'SERVER', JSON.stringify(chunks));
 }
 {
   const body = [eventOf('response.error', { code: 'overloaded', message: 'slow down' })].join('\n\n') + '\n\n';
   const chunks = [];
   for await (const chunk of openaiResponsesToChunks(responseOf([body]))) chunks.push(chunk);
-  check('responses-sse-error: error finish with code passthrough', chunks.length === 1 && chunks[0].type === 'finish' && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.code === 'overloaded' && chunks[0].reason?.failure?.message === 'slow down', JSON.stringify(chunks));
+  check('responses-sse-error: overloaded mapped to SERVER (retryable)', chunks.length === 1 && chunks[0].type === 'finish' && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.code === 'SERVER' && chunks[0].reason?.failure?.message === 'slow down (overloaded)', JSON.stringify(chunks));
 }
 
 // 8. Unknown events / malformed data are skipped safely; the stream still terminates.
@@ -196,13 +198,13 @@ check('responses-tools: undefined tools -> empty list', toOpenAIResponsesTools(u
   const body = [eventOf('error', { code: 'insufficient_quota', message: 'quota exceeded' })].join('\n\n') + '\n\n';
   const chunks = [];
   for await (const chunk of openaiResponsesToChunks(responseOf([body]))) chunks.push(chunk);
-  check('responses-sse-error-data: data-JSON error -> structured error finish', chunks.length === 1 && chunks[0].type === 'finish' && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.code === 'insufficient_quota' && chunks[0].reason?.failure?.message === 'quota exceeded', JSON.stringify(chunks));
+  check('responses-sse-error-data: exhausted quota mapped to QUOTA (never retryable)', chunks.length === 1 && chunks[0].type === 'finish' && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.code === 'QUOTA' && chunks[0].reason?.failure?.message === 'quota exceeded (insufficient_quota)', JSON.stringify(chunks));
 }
 {
   const body = 'event: error\ndata: upstream exploded (not json)\n\n';
   const chunks = [];
   for await (const chunk of openaiResponsesToChunks(responseOf([body]))) chunks.push(chunk);
-  check('responses-sse-error-text: bare event:error text -> error finish with raw message', chunks.length === 1 && chunks[0].type === 'finish' && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.message === 'upstream exploded (not json)' && chunks[0].reason?.failure?.code === 'UPSTREAM_ERROR', JSON.stringify(chunks));
+  check('responses-sse-error-text: bare event:error text -> error finish with raw message', chunks.length === 1 && chunks[0].type === 'finish' && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.message === 'upstream exploded (not json)' && chunks[0].reason?.failure?.code === 'SERVER', JSON.stringify(chunks));
 }
 
 // 10. block-start emitted exactly once: duplicate added tolerated, and a delta
@@ -246,7 +248,10 @@ check('responses-tools: undefined tools -> empty list', toOpenAIResponsesTools(u
   ].join('\n\n') + '\n\n';
   const chunks = [];
   for await (const chunk of openaiResponsesToChunks(responseOf([body]))) chunks.push(chunk);
-  check('responses-sse-done-gate: identity-less unknown done ignored (stop finish, no tool block)', JSON.stringify(chunks.map((c) => c.type)) === JSON.stringify(['finish']) && chunks[0].reason?.kind === 'stop', JSON.stringify(chunks));
+  // The identity-less done fabricates no tool block; what remains is a
+  // completed response with zero output — EMPTY_RESPONSE, not a silent stop
+  // that would hand the loop an empty assistant message.
+  check('responses-sse-done-gate: identity-less unknown done ignored (no tool block; empty response is a failure)', JSON.stringify(chunks.map((c) => c.type)) === JSON.stringify(['finish']) && chunks[0].reason?.kind === 'error' && chunks[0].reason?.failure?.code === 'EMPTY_RESPONSE', JSON.stringify(chunks));
 }
 {
   const body = [
@@ -281,7 +286,9 @@ check('responses-tools: undefined tools -> empty list', toOpenAIResponsesTools(u
   const chunks = [];
   for await (const chunk of openaiResponsesToChunks(responseOf([body]))) chunks.push(chunk);
   const usage = chunks.find((c) => c.type === 'usage');
-  check('responses-sse-usage-fallback: failed payload.usage honored (usage before error finish)', usage?.usage?.inputTokens === 6 && usage?.usage?.outputTokens === 2 && chunks.at(-1)?.reason?.kind === 'error' && chunks.at(-1)?.reason?.failure?.message === 'boom', JSON.stringify(chunks));
+  check('responses-sse-usage-fallback: failed payload.usage honored (usage before error finish)', usage?.usage?.inputTokens === 6 && usage?.usage?.outputTokens === 2 && chunks.at(-1)?.reason?.kind === 'error'
+    && chunks.at(-1)?.reason?.failure?.code === 'SERVER'
+    && chunks.at(-1)?.reason?.failure?.message === 'boom (server_error)', JSON.stringify(chunks));
 }
 
 if (failures > 0) process.exit(1);

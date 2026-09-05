@@ -21,6 +21,7 @@ import { sanitizeExtraHeaders } from './adapter.ts';
 import { effectiveUserAgent, type GatewayConfig } from './types.ts';
 import { redactUrl, resolveEndpointUrl } from './url.ts';
 import { anthropicSseToChunks, toAnthropicMessages } from './wire/anthropic.ts';
+import { classifyHttpStatus, classifyTransportError, parseRetryAfterMs, EMPTY_RESPONSE_CODE, UPSTREAM_ERROR_CODE } from './wire/failure.ts';
 import { openaiCompletionsToChunks, toOpenAIMessages } from './wire/openai.ts';
 import { responsesSseToChunks, toResponsesInput } from './wire/responses.ts';
 
@@ -141,7 +142,10 @@ export async function probeChatConnection(
     });
   } catch (error) {
     if (signal?.aborted) throw new LlmError('probe aborted by caller', 'ABORTED', { cause: error });
-    throw new LlmError(`could not reach ${redactUrl(url)}`, 'UPSTREAM_ERROR', { cause: error });
+    // Classified exactly like the live adapter's dial, so the banner names the
+    // real condition (transport vs timeout) instead of a blanket failure.
+    const classified = classifyTransportError(error);
+    throw new LlmError(`could not reach ${redactUrl(url)}: ${classified.message}`, classified.code, { cause: error });
   }
   if (!response.ok) {
     let text = await response.text().catch(() => '');
@@ -150,9 +154,11 @@ export async function probeChatConnection(
     if (supplied !== undefined && supplied !== '' && text.includes(supplied)) {
       text = text.split(supplied).join('***');
     }
+    const classified = classifyHttpStatus(response.status, text, parseRetryAfterMs(response.headers.get('retry-after')));
     throw new LlmError(
       `upstream ${response.status}${response.status === 401 || response.status === 403 ? '; check the API key' : ''}: ${text.slice(0, 300)}`,
-      'UPSTREAM_ERROR',
+      classified.code,
+      { status: response.status },
     );
   }
   // Consume the SAME SSE→StreamChunk converter the live adapter uses and
@@ -178,11 +184,13 @@ export async function probeChatConnection(
     } else if (chunk.type === 'finish') {
       const reason = chunk.reason;
       if (reason.kind === 'error') {
-        throw new LlmError(reason.failure?.message ?? 'the model stream ended with an error', 'UPSTREAM_ERROR');
+        // The converter already classified the failure; pass its code through
+        // so the banner reports the same condition the live path would.
+        throw new LlmError(reason.failure?.message ?? 'the model stream ended with an error', reason.failure?.code ?? UPSTREAM_ERROR_CODE);
       }
       if (reason.kind === 'aborted') throw new LlmError('probe aborted by caller', 'ABORTED');
       if (!sawOutput) {
-        throw new LlmError(`${redactUrl(url)} answered, but the response stream carried no model output`, 'UPSTREAM_ERROR');
+        throw new LlmError(`${redactUrl(url)} answered, but the response stream carried no model output`, EMPTY_RESPONSE_CODE);
       }
       return {
         endpoint: redactUrl(url),

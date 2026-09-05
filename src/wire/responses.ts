@@ -30,14 +30,21 @@
  * already-emitted chunks. The finish kind reflects the protocol's own stop
  * semantics: `tool-calls` when a function call streamed, `max-tokens` when the
  * response ended incomplete with `incomplete_details.reason === 'max_output_tokens'`,
- * `stop` otherwise; `response.failed` / `response.error` / a data-`error` event produce an error
- * finish; caller aborts produce an aborted finish.
+ * `stop` otherwise. Every other ending is a CLASSIFIED failure (see
+ * ./failure.ts) rather than a silent `stop`, because the host's retry executor
+ * routes on the failure code alone: `response.failed` / `response.error` /
+ * a data-`error` event map the upstream's own code onto a DSH code, a torn read
+ * is a transport failure, a stream that never reached a terminal event is a
+ * truncated reply, and a completed response that carried no output at all is
+ * EMPTY_RESPONSE. Caller aborts produce an aborted finish, which is not a
+ * failure and no policy may act on.
  *
  * @module dsh-provider-hub/wire/responses
  */
 import type { ContentBlock, StreamChunk, TokenUsage, ToolSchema } from '@deepseek-ai/dsh-llm';
 import type { WireInputMessage } from '../types.ts';
-import { errorFinish, iterateSse } from './sse.ts';
+import { classifyProviderError, classifyStreamEnd, classifyTransportError } from './failure.ts';
+import { abortedFinish, errorFinish, iterateSse } from './sse.ts';
 
 // ---------------------------------------------------------------------------
 // Request-side shapes
@@ -319,7 +326,8 @@ export async function* responsesSseToChunks(response: Response, signal?: AbortSi
   let terminal: 'completed' | 'incomplete' | 'failed' | undefined;
   let incompleteReason: string | undefined;
   let errorMessage: string | undefined;
-  let errorCode = 'UPSTREAM_ERROR';
+  /** The upstream's own error code, mapped onto a DSH code at the terminal chunk. */
+  let errorCode: string | undefined;
   let usage: TokenUsage | undefined;
   /** Streaming function-call blocks keyed by item id. */
   const toolPartials = new Map<string, ToolPartial>();
@@ -358,6 +366,31 @@ export async function* responsesSseToChunks(response: Response, signal?: AbortSi
       return partial;
     }
     return partial;
+  };
+
+  /**
+   * Close every block still open, in DSH index order. Emitted before ANY
+   * terminal chunk: a completed response, a failure, or an early stream end
+   * must never discard the deltas already delivered above.
+   */
+  const closePending = (): StreamChunk[] => {
+    const pending: StreamChunk[] = [];
+    if (sawReasoning && reasoningIndex >= 0) {
+      pending.push({ type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoning } });
+    }
+    if (sawText && textIndex >= 0) {
+      pending.push({ type: 'block-end', index: textIndex, block: { type: 'text', text } });
+    }
+    for (const partial of [...toolPartials.values()].sort((a, b) => a.dshIndex - b.dshIndex)) {
+      if (!partial.closed) {
+        pending.push({
+          type: 'block-end',
+          index: partial.dshIndex,
+          block: { type: 'tool-call', id: partial.callId as never, name: partial.name, arguments: toolArguments(partial.arguments) },
+        });
+      }
+    }
+    return pending;
   };
 
   try {
@@ -552,34 +585,28 @@ export async function* responsesSseToChunks(response: Response, signal?: AbortSi
       if (terminal !== undefined) break;
     }
   } catch (error) {
-    if (signal?.aborted) yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted' } } };
-    else yield errorFinish(error instanceof Error ? error.message : String(error));
+    // A caller cancellation is not a failure: no retry policy may act on it.
+    if (signal?.aborted) {
+      yield abortedFinish();
+      return;
+    }
+    const classified = classifyTransportError(error);
+    yield* closePending();
+    if (usage !== undefined) yield { type: 'usage', usage };
+    yield errorFinish(classified.message, classified.code);
     return;
   }
 
-  // Close every block still open BEFORE the terminal chunks: response.completed
-  // (or an error, or an early stream end) must never discard the deltas
-  // already delivered above.
-  const pending: StreamChunk[] = [];
-  if (sawReasoning && reasoningIndex >= 0) {
-    pending.push({ type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoning } });
-  }
-  if (sawText && textIndex >= 0) {
-    pending.push({ type: 'block-end', index: textIndex, block: { type: 'text', text } });
-  }
-  for (const partial of [...toolPartials.values()].sort((a, b) => a.dshIndex - b.dshIndex)) {
-    if (!partial.closed) {
-      pending.push({
-        type: 'block-end',
-        index: partial.dshIndex,
-        block: { type: 'tool-call', id: partial.callId as never, name: partial.name, arguments: toolArguments(partial.arguments) },
-      });
-    }
-  }
-  for (const chunk of pending) yield chunk;
+  yield* closePending();
   if (usage !== undefined) yield { type: 'usage', usage };
   if (terminal === 'failed') {
-    yield errorFinish(errorMessage ?? 'the upstream reported a failed response', errorCode);
+    const message = errorMessage ?? 'the upstream reported a failed response';
+    const classified = classifyProviderError(errorCode, message);
+    // The mapped code is the ROUTING identity the host's retry executor reads;
+    // the upstream's own spelling stays in the message so a gateway-specific
+    // condition remains diagnosable after the mapping.
+    const annotated = errorCode === undefined || errorCode === classified.code ? message : `${message} (${errorCode})`;
+    yield errorFinish(annotated, classified.code);
     return;
   }
   if (terminal === 'incomplete') {
@@ -591,6 +618,14 @@ export async function* responsesSseToChunks(response: Response, signal?: AbortSi
       `the upstream response ended incomplete${incompleteReason ? `: ${incompleteReason}` : ''}`,
       'INCOMPLETE_RESPONSE',
     );
+    return;
+  }
+  // No `response.completed`: either the stream was cut mid-reply or the
+  // upstream produced nothing at all. Both are classified failures, not a
+  // `stop` that would present a truncated or empty answer as complete.
+  const endFailure = classifyStreamEnd(terminal === 'completed', sawText || sawReasoning || sawToolCall);
+  if (endFailure !== undefined) {
+    yield errorFinish(endFailure.message, endFailure.code);
     return;
   }
   yield { type: 'finish', reason: sawToolCall ? { kind: 'tool-calls' } : { kind: 'stop' } };

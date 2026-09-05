@@ -22,7 +22,7 @@ src/
 ├── adapter.ts          # GatewayAdapter（LlmAdapter 实现：三协议请求 + chunk 转换 + 凭据/请求头处理）
 ├── discovery.ts        # 模型发现（带自定义 UA 拉 GET {baseURL}/models）
 ├── probe.ts            # 连接测试第二段（/models 不通时经首选模型发 "hi" 实聊验证）
-├── url.ts              # endpoint 规范化（/v1 自动补齐 / custom 完整地址，防 /v1/v1）
+├── url.ts              # endpoint 规范化（/v1 自动补齐 / custom 完整地址，防 /v1/v1）+ 凭据 URL 遮蔽
 ├── host/
 │   ├── contract.ts     # Typert wire 契约（INVOCATIONS / TYPERT_MANIFEST，host+client 共享）
 │   └── runtime.ts      # ProviderHubRuntime（Remote 服务：配置读写/模型管理/发现/连接测试）
@@ -34,7 +34,8 @@ src/
 │   └── primitives.d.ts # 宿主 UI 原语类型 shim
 ├── client-runtime.d.ts # 宿主全局类型 shim
 └── wire/
-    ├── sse.ts          # 通用 SSE 解析器
+    ├── failure.ts      # 失败分类：HTTP 状态 / 传输抛错 / 上游原生错误码 / 流终局 → DSH 失败码（重试的唯一路由依据）
+    ├── sse.ts          # 通用 SSE 解析器 + 终局 chunk 构造（error / aborted / provider-error）
     ├── anthropic.ts    # Anthropic 消息/工具转换 + SSE -> StreamChunk
     ├── openai.ts       # OpenAI 消息转换 + chat.completion.chunk -> StreamChunk
     └── responses.ts    # openai-responses 路径（input/usage/finish 转换）
@@ -52,6 +53,7 @@ src/
 | 模型进选择器 | `ctx.llm.registerAdapter(providers, adapter)` 一次注册全部网关路由（adapter 按 `options.provider` 选路） |
 | 一键发现模型 | `ctx.llm.registerModelDiscovery(NS, discover)`：带自定义 UA 请求 `GET {baseURL}/models`，解析 `context_window`/`max_output_tokens` 等（按网关） |
 | 内置模型参数 | `MODEL_CATALOG`：主流模型（GLM / Claude / GPT / Qwen / DeepSeek / Kimi / Gemini）的 contextWindow、maxTokens、输入模态、reasoningEfforts |
+| 失败自动重试 | 适配器把每种上游/传输失败分类到宿主重试执行器认识的规范码（瞬态条件重发，确定性失败如实上报），语义见「失败分类与自动重试」 |
 
 ## 安装
 
@@ -131,9 +133,37 @@ GLM-5.3 / GLM-5.3-Flash / Claude Opus 4.8·4.6 / Sonnet 5·4.6 / Haiku 4.5 / GPT
 - `modelOverrides` 的 `reasoningEfforts` 整体替换内置映射（字典无删除语义；留空 `{}` 视为未设置，保留内置映射）。
 - 模型配置面板可在**配置 JSON** 中按模型 id 编辑 `reasoningEfforts`（组内写该字段即生效，未写保留原值）；删除该字段则回落内置映射。
 
+## 失败分类与自动重试
+
+DSH 的请求重试是三段式的：适配器声明策略 → 一次 `stream()` 只尝试一次，把结果作为终局 `finish` 上报（成功，或携带 `failure`）→ 宿主的重试执行器按 **`failure.code`** 决定是否重发。也就是说**失败码是重试的唯一路由依据**：码不在策略的可重试集合里，执行器直接把失败交给下游，本轮就此结束——表现为要用户手动输入「继续」才能推进对话。
+
+本插件沿用宿主默认 `normal` 策略（最多 5 次、500ms→10s 指数退避带抖动、尊重上游 `Retry-After`），可重试集合为 `EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` / `TIMEOUT` / `TRANSPORT`；三协议与 HTTP 边界上能观察到的每种失败都分类到规范码：
+
+| 观察到的情况 | 失败码 | 重试 |
+|---|---|---|
+| HTTP 429、上游 `rate_limit*` / `too_many_requests` | `RATE_LIMIT`（带上游 `Retry-After`） | ✅ |
+| HTTP 5xx、上游 `overloaded` / `server_error` / `api_error`，以及流内无法归类的中继错误 | `SERVER` | ✅ |
+| HTTP 408/425、上游 `timeout*`、请求超时 | `TIMEOUT` | ✅ |
+| 连接被拒/重置、DNS 失败、流被掐断 | `TRANSPORT` | ✅ |
+| 有终局标记但**零输出**（退化补全，空 assistant 消息会静默结束本轮） | `EMPTY_RESPONSE` | ✅ |
+| 已投递内容后**终局标记缺失**（半截回答不能当完整） | `TRANSPORT` | ✅ |
+| HTTP 401/403、上游 `authentication_error` / `invalid_api_key` | `AUTH` | ❌ |
+| HTTP 400/404/413/422、上游 `invalid_request*`、内容策略拒绝 | `INVALID_REQUEST` | ❌ |
+| 上下文超限 | `CONTEXT_WINDOW_EXCEEDED` | ❌ |
+| 配额/余额/欠费耗尽 | `QUOTA` | ❌ |
+| 配置错误（未知模型、未声明的思考档位、坏 baseURL/UA/请求头、缺凭据） | `UNKNOWN_MODEL` / `UNSUPPORTED_REASONING_EFFORT` / `UPSTREAM_ERROR` | ❌ |
+| 调用方取消 | `aborted` 终局（不是失败，任何策略都不得介入） | ❌ |
+
+不重试的类别都是**同一请求必然同样失败**的情况，重试只是白烧时间。三点实现细节：
+
+- **`Retry-After` 超过策略上限时丢弃而非转发**：执行器把超过 `maxDelayMs` 的 `providerRetryAfterMs` 当作「放弃重试」（`normal` 模式直接委托下游），而不是「等更久」，所以一个 `Retry-After: 600` 若原样转发反而会取消掉整轮重试。上限读自宿主默认策略本身，两处不会漂移。
+- **上游原生错误码保留在 message 里**：映射后的码是给执行器读的路由身份，网关自己的拼写以 `(原生码)` 括注进失败消息，映射后仍可诊断。
+- **分类不丢弃已投递的内容**：三个转换器统一按「先关闭未闭合的块 → usage → 终局分类」的顺序收尾，半截回答的 delta 不会被失败覆盖掉。
+
 ## 验证
 
-- 单测（`test/plugin.test.mjs`，全过）：Config schema（多网关）、多网关注册（`registerConfigurableProviders`/`registerAdapter` 各 2 路由）、网关隔离（`listModels` A 不含 B 的模型）、内置+自定义模型解析、`listModels`/`resolveModel`（含 UNKNOWN_MODEL 拒绝）、`prepareCall`、两种协议的 SSE→chunk 转换（文本、流式 tool_use、流式 tool_calls、reasoning_content）、模型发现字段映射、思考强度派发（wire 拼写、off 显式关闭、未声明/未映射档位请求前拒绝、map 校验、lone-off 清理）、runtime 按网关 index 的增删改/provider 改名实时生效（重名/空名拒绝）/自定义、**两段式连接测试**（/models 优先且成功即止——仅一次请求；/models 不通回退三协议 "hi" 实聊探测、首选模型选取、草稿 model 原样派发、/models 不通且无模型的引导失败、两段皆败合并报错、坏 URL/CRLF 请求头拒绝、上游 401 回显脱敏、凭据 URL 掩码、custom 模式两段各自 verbatim 端点）。
+- 单测（`test/plugin.test.mjs`，全过）：Config schema（多网关）、多网关注册（`registerConfigurableProviders`/`registerAdapter` 各 2 路由）、网关隔离（`listModels` A 不含 B 的模型）、内置+自定义模型解析、`listModels`/`resolveModel`（含 UNKNOWN_MODEL 拒绝）、`prepareCall`、两种协议的 SSE→chunk 转换（文本、流式 tool_use、流式 tool_calls、reasoning_content）、模型发现字段映射、思考强度派发（wire 拼写、off 显式关闭、未声明/未映射档位请求前拒绝、map 校验、lone-off 清理）、runtime 按网关 index 的增删改/provider 改名实时生效（重名/空名拒绝）/自定义、**两段式连接测试**（/models 优先且成功即止——仅一次请求；/models 不通回退三协议 "hi" 实聊探测、首选模型选取、草稿 model 原样派发、/models 不通且无模型的引导失败、两段皆败合并报错、坏 URL/CRLF 请求头拒绝、上游 401 回显脱敏、凭据 URL 掩码、custom 模式两段各自 verbatim 端点）、**失败分类回归**（429→`RATE_LIMIT` 且带 `status`/`providerRetryAfterMs`、超上限 `Retry-After` 被丢弃、503→`SERVER`、401→`AUTH`、拒连→`TRANSPORT`、半截流→`TRANSPORT` 且不丢已投递 delta、零输出→`EMPTY_RESPONSE`）。
+- wire 单测（`test/wire.test.mjs` / `test/responses.test.mjs`，全过）：三协议各自的终局分类——`[DONE]`+`finish_reason` / `message_stop` / `response.completed` 的正常三态（stop / max-tokens / tool-calls）、流内 error 事件与 in-band error 对象的码映射、传输抛错、截断与零输出，以及分类函数本身的单元断言（HTTP 状态、`Retry-After` 两种拼写、上游原生码映射表、文本兜底顺序、凭据 URL 遮蔽）。
 - 渲染冒烟（`test/client-page.test.mjs`，全过）：面板结构（hero/页签/卡片/编辑器）与模型列表 ⇄ 配置 JSON 双向契约——常驻完整参数框架（null=未设置、目录值不泄漏）、手动输完整目录 id 不自动填参、点选下拉/↑↓+Enter 才套用预设、JSON 手写组重建列表行、无效 JSON 锁定列表编辑。
 - live（假 key）：对按 UA 白名单校验的网关，自定义 UA 生效（UA 关通过、key 关拒绝）；配真 key 即可用。
 

@@ -10,7 +10,8 @@
  */
 import type { ContentBlock, StreamChunk, ToolSchema, TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { OpenAIChatChunk, OpenAIChatUsage, WireInputMessage } from '../types.ts';
-import { errorFinish, iterateSse } from './sse.ts';
+import { classifyStreamEnd, classifyTransportError } from './failure.ts';
+import { abortedFinish, errorFinish, iterateSse, providerErrorFinish } from './sse.ts';
 
 /**
  * One OpenAI chat wire message (the subset this adapter emits). Tool
@@ -166,6 +167,15 @@ export function toTokenUsage(usage: OpenAIChatUsage | undefined): TokenUsage | u
  * Text / reasoning_content / streaming tool_calls each map to their own
  * block; usage from the final chunk is emitted as a `usage` chunk before the
  * terminal `finish`.
+ *
+ * The terminal chunk is always CLASSIFIED (see ./failure.ts), because the host's
+ * retry executor routes on the failure code alone. Four endings are failures
+ * rather than a `stop`: an in-stream `error` payload (the gateway accepted the
+ * request and then failed while relaying), a torn read, a stream that never
+ * reached `[DONE]` or a `finish_reason` (a truncated reply must not be
+ * presented as complete), and a completion that carried no output at all (an
+ * empty assistant message would silently end the turn). Caller cancellation
+ * stays an `aborted` finish — it is not a failure and no policy may act on it.
  */
 export async function* openaiCompletionsToChunks(response: Response, signal?: AbortSignal): AsyncGenerator<StreamChunk> {
   let nextIndex = 0;
@@ -177,14 +187,47 @@ export async function* openaiCompletionsToChunks(response: Response, signal?: Ab
   let sawReasoning = false;
   let sawToolCall = false;
   let finished = false;
+  /** The protocol's own terminal marker arrived (`[DONE]` or a finish_reason). */
+  let sawTerminal = false;
+  /** A `length` finish_reason: the output cap was reached — a complete answer. */
+  let sawLength = false;
+  /** Failure reported inside the stream body (HTTP 200, then an error chunk). */
+  let inStreamFailure: StreamChunk | undefined;
   let usage: TokenUsage | undefined;
   const toolCalls = new Map<number, ToolCallPartial>();
+
+  /**
+   * Close every block still open, in DSH index order (reasoning/text/tools may
+   * interleave). Emitted before ANY terminal chunk, so a failure never
+   * discards the deltas already delivered above.
+   */
+  const closeBlocks = (): StreamChunk[] => {
+    const closes: StreamChunk[] = [];
+    if (sawReasoning) closes.push({ type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoning } });
+    if (sawText) closes.push({ type: 'block-end', index: textIndex, block: { type: 'text', text } });
+    for (const partial of [...toolCalls.values()].sort((a, b) => a.dshIndex - b.dshIndex)) {
+      closes.push({
+        type: 'block-end',
+        index: partial.dshIndex,
+        block: { type: 'tool-call', id: partial.id as never, name: partial.name, arguments: partial.arguments },
+      });
+    }
+    return closes.sort((a, b) => (a as { index: number }).index - (b as { index: number }).index);
+  };
+
   try {
     for await (const sse of iterateSse(response, signal)) {
-      if (sse.data === '[DONE]') break;
+      if (sse.data === '[DONE]') {
+        sawTerminal = true;
+        break;
+      }
       let payload: OpenAIChatChunk;
       try { payload = JSON.parse(sse.data) as OpenAIChatChunk; } catch { continue; }
       if (payload.usage !== undefined) usage = toTokenUsage(payload.usage);
+      if (payload.error !== undefined && payload.error !== null) {
+        inStreamFailure = providerErrorFinish(sse.data);
+        break;
+      }
       const choice = payload.choices?.[0];
       if (finished) continue;
       const delta = choice?.delta;
@@ -227,32 +270,43 @@ export async function* openaiCompletionsToChunks(response: Response, signal?: Ab
           }
         }
       }
-      if (choice?.finish_reason === 'tool_calls') {
-        // Tool blocks are flushed below; stop processing deltas but keep
-        // reading so a trailing usage chunk is still captured.
-        finished = true;
+      const reason = choice?.finish_reason;
+      if (typeof reason === 'string' && reason !== '') {
+        sawTerminal = true;
+        if (reason === 'length' || reason === 'max_tokens') sawLength = true;
+        if (reason === 'tool_calls' || reason === 'function_call') {
+          // Tool blocks are flushed below; stop processing deltas but keep
+          // reading so a trailing usage chunk is still captured.
+          finished = true;
+        }
       }
     }
   } catch (error) {
-    if (signal?.aborted) yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted' } } };
-    else yield errorFinish(error instanceof Error ? error.message : String(error));
+    if (signal?.aborted) {
+      yield abortedFinish();
+      return;
+    }
+    // A torn read is a transport failure, not an empty success: classify it so
+    // the executor can re-attempt the step.
+    const classified = classifyTransportError(error);
+    yield* closeBlocks();
+    if (usage !== undefined) yield { type: 'usage', usage };
+    yield errorFinish(classified.message, classified.code);
     return;
   }
-  // Close blocks in DSH index order (reasoning/text/tools may interleave).
-  const closes: StreamChunk[] = [];
-  if (sawReasoning) closes.push({ type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoning } });
-  if (sawText) closes.push({ type: 'block-end', index: textIndex, block: { type: 'text', text } });
-  for (const partial of [...toolCalls.values()].sort((a, b) => a.dshIndex - b.dshIndex)) {
-    closes.push({
-      type: 'block-end',
-      index: partial.dshIndex,
-      block: { type: 'tool-call', id: partial.id as never, name: partial.name, arguments: partial.arguments },
-    });
-  }
-  for (const chunk of closes.sort((a, b) => (a as { index: number }).index - (b as { index: number }).index)) yield chunk;
+  yield* closeBlocks();
   if (usage !== undefined) yield { type: 'usage', usage };
+  if (inStreamFailure !== undefined) {
+    yield inStreamFailure;
+    return;
+  }
+  const endFailure = classifyStreamEnd(sawTerminal, sawText || sawReasoning || sawToolCall);
+  if (endFailure !== undefined) {
+    yield errorFinish(endFailure.message, endFailure.code);
+    return;
+  }
   yield {
     type: 'finish',
-    reason: sawToolCall ? { kind: 'tool-calls' } : { kind: 'stop' },
+    reason: sawToolCall ? { kind: 'tool-calls' } : sawLength ? { kind: 'max-tokens' } : { kind: 'stop' },
   };
 }

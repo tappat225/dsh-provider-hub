@@ -7,7 +7,12 @@
 //   2. OpenAI multi-turn tool-message conversion: assistant `tool_calls`,
 //      `tool`-role results with tool_call_id correlation, reasoning dropped,
 //      system role preserved, legacy `callId` tolerated.
-//   3. The OpenAI SSE converter end-to-end over a CRLF-framed stream.
+//   3. The OpenAI SSE converter end-to-end over a CRLF-framed stream, plus the
+//      terminal-classification contract every converter shares.
+//   3b. Failure classification: the codes the host retry executor routes on
+//      (Retry-After parsing, HTTP status mapping, wording fallbacks, provider
+//      error-code mapping, stream-end classification) and the Anthropic
+//      converter's terminal chunks.
 //   4. The unified endpoint resolver: auto (/v1 normalization) and custom
 //      (verbatim complete URLs) modes across every request path, plus
 //      dangerous/invalid URL refusal with credential redaction.
@@ -17,7 +22,16 @@
 //      deltas, output_item added/done, completed / incomplete / failed /
 //      error, abort).
 import { iterateSse } from '../src/wire/sse.ts';
+import { anthropicSseToChunks } from '../src/wire/anthropic.ts';
 import { openaiCompletionsToChunks, toOpenAIMessages } from '../src/wire/openai.ts';
+import {
+  classifyErrorText,
+  classifyHttpStatus,
+  classifyProviderError,
+  classifyStreamEnd,
+  classifyTransportError,
+  parseRetryAfterMs,
+} from '../src/wire/failure.ts';
 import {
   responsesSseToChunks,
   toResponsesInput,
@@ -146,6 +160,191 @@ check('crlf e2e: tool-call block-end with name', chunks.some((c) => c.type === '
 const usageChunk = chunks.find((c) => c.type === 'usage');
 check('crlf e2e: usage chunk parsed (disjoint input)', usageChunk?.usage?.inputTokens === 90 && usageChunk?.usage?.outputTokens === 10, JSON.stringify(usageChunk));
 check('crlf e2e: finish tool-calls last', chunks.at(-1)?.type === 'finish' && chunks.at(-1)?.reason?.kind === 'tool-calls', JSON.stringify(chunks.at(-1)));
+
+// 3b. OpenAI converter terminal classification. The host retry executor acts on
+// the failure CODE alone, so every non-honest ending must carry one from the
+// retryable set (EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT)
+// instead of a blanket code or a fake `stop`.
+const oaiChunk = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
+async function oaiChunksOf(chunks, signal) {
+  const out = [];
+  for await (const chunk of openaiCompletionsToChunks(responseOf(chunks), signal)) out.push(chunk);
+  return out;
+}
+{
+  // Truncated: content streamed, but neither `[DONE]` nor a finish_reason
+  // arrived. Must NOT be presented as a complete `stop`.
+  const cut = await oaiChunksOf([oaiChunk({ choices: [{ index: 0, delta: { content: 'half an answer' }, finish_reason: null }] })]);
+  check('openai-sse: truncated stream (no [DONE], no finish_reason) -> TRANSPORT error finish', cut.at(-1)?.reason?.kind === 'error' && cut.at(-1)?.reason?.failure?.code === 'TRANSPORT', JSON.stringify(cut.at(-1)));
+  check('openai-sse: truncated stream still closes the delivered text', cut.some((c) => c.type === 'block-end' && c.block?.text === 'half an answer'), JSON.stringify(cut.map((c) => c.type)));
+}
+{
+  // Degenerate completion: a terminal stop with zero output. An empty assistant
+  // message would silently end the turn, so it is a retryable EMPTY_RESPONSE.
+  const empty = await oaiChunksOf([
+    oaiChunk({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }),
+    oaiChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 4, completion_tokens: 0, total_tokens: 4 } }),
+    'data: [DONE]\n\n',
+  ]);
+  check('openai-sse: terminal stop with no output -> EMPTY_RESPONSE error finish', empty.at(-1)?.reason?.kind === 'error' && empty.at(-1)?.reason?.failure?.code === 'EMPTY_RESPONSE', JSON.stringify(empty.at(-1)));
+  check('openai-sse: empty response still reports usage before the failure', empty.some((c) => c.type === 'usage' && c.usage?.inputTokens === 4), JSON.stringify(empty.map((c) => c.type)));
+}
+{
+  // In-stream error payload: the gateway accepted the request (HTTP 200) and
+  // then failed while relaying. Its native code is mapped, not passed through.
+  const err = await oaiChunksOf([
+    oaiChunk({ choices: [{ index: 0, delta: { content: 'par' }, finish_reason: null }] }),
+    oaiChunk({ error: { message: 'boom mid-stream', type: 'server_error', code: null } }),
+  ]);
+  check('openai-sse: in-stream error payload -> SERVER error finish', err.at(-1)?.reason?.kind === 'error' && err.at(-1)?.reason?.failure?.code === 'SERVER' && err.at(-1)?.reason?.failure?.message === 'boom mid-stream', JSON.stringify(err.at(-1)));
+  check('openai-sse: in-stream error keeps the deltas already delivered', err.some((c) => c.type === 'text-delta' && c.text === 'par') && err.some((c) => c.type === 'block-end'), JSON.stringify(err.map((c) => c.type)));
+  const limited = await oaiChunksOf([oaiChunk({ error: { message: 'slow down', type: 'rate_limit_exceeded' } })]);
+  check('openai-sse: in-stream rate limit -> RATE_LIMIT error finish', limited.at(-1)?.reason?.failure?.code === 'RATE_LIMIT', JSON.stringify(limited.at(-1)));
+}
+{
+  // `length` is the output cap, not an error: a complete-as-allowed answer.
+  const capped = await oaiChunksOf([
+    oaiChunk({ choices: [{ index: 0, delta: { content: 'cut short' }, finish_reason: null }] }),
+    oaiChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'length' }] }),
+    'data: [DONE]\n\n',
+  ]);
+  check('openai-sse: finish_reason length -> max-tokens finish (not an error)', capped.at(-1)?.reason?.kind === 'max-tokens', JSON.stringify(capped.at(-1)));
+}
+{
+  // Caller cancellation is an abort, never a failure a policy may retry.
+  const controller = new AbortController();
+  controller.abort();
+  const stream = new ReadableStream({
+    start(c) {
+      c.enqueue(encoder.encode(oaiChunk({ choices: [{ index: 0, delta: { content: 'pre' }, finish_reason: null }] })));
+      setTimeout(() => c.error(new Error('This operation was aborted')), 5);
+    },
+  });
+  const out = [];
+  for await (const chunk of openaiCompletionsToChunks(new Response(stream), controller.signal)) out.push(chunk);
+  check('openai-sse: caller abort -> aborted finish (ABORTED code)', out.at(-1)?.reason?.kind === 'aborted' && out.at(-1)?.reason?.failure?.code === 'ABORTED', JSON.stringify(out.at(-1)));
+}
+{
+  // A torn read with no caller abort is a transport failure.
+  const torn = new Response(new ReadableStream({
+    start(c) {
+      c.enqueue(encoder.encode(oaiChunk({ choices: [{ index: 0, delta: { content: 'x' }, finish_reason: null }] })));
+      c.error(new TypeError('fetch failed', { cause: Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }) }));
+    },
+  }));
+  const out = [];
+  for await (const chunk of openaiCompletionsToChunks(torn)) out.push(chunk);
+  check('openai-sse: torn read -> TRANSPORT error finish rendering the cause chain', out.at(-1)?.reason?.kind === 'error' && out.at(-1)?.reason?.failure?.code === 'TRANSPORT'
+    && /connection reset/.test(out.at(-1)?.reason?.failure?.message ?? ''), JSON.stringify(out.at(-1)));
+}
+
+// 3c. Anthropic converter terminal classification (same contract).
+const anthOf = (obj, event) => `event: ${event ?? obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
+async function anthChunksOf(chunks, signal) {
+  const out = [];
+  for await (const chunk of anthropicSseToChunks(responseOf(chunks), signal)) out.push(chunk);
+  return out;
+}
+{
+  const ok = await anthChunksOf([
+    anthOf({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+    anthOf({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } }),
+    anthOf({ type: 'content_block_stop', index: 0 }),
+    anthOf({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } }),
+    anthOf({ type: 'message_stop' }),
+  ]);
+  check('anthropic-sse: complete message -> stop finish', ok.at(-1)?.reason?.kind === 'stop', JSON.stringify(ok.at(-1)));
+  const empty = await anthChunksOf([
+    anthOf({ type: 'message_start', message: { id: 'm1', usage: { input_tokens: 3 } } }),
+    anthOf({ type: 'message_stop' }),
+  ]);
+  check('anthropic-sse: message_stop with no content -> EMPTY_RESPONSE error finish', empty.at(-1)?.reason?.kind === 'error' && empty.at(-1)?.reason?.failure?.code === 'EMPTY_RESPONSE', JSON.stringify(empty.at(-1)));
+  const cut = await anthChunksOf([
+    anthOf({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+    anthOf({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } }),
+  ]);
+  check('anthropic-sse: no message_stop -> TRANSPORT error finish + open block closed', cut.at(-1)?.reason?.kind === 'error' && cut.at(-1)?.reason?.failure?.code === 'TRANSPORT'
+    && cut.some((c) => c.type === 'block-end' && c.block?.text === 'partial'), JSON.stringify(cut));
+  const capped = await anthChunksOf([
+    anthOf({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+    anthOf({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'long' } }),
+    anthOf({ type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 9 } }),
+  ]);
+  check('anthropic-sse: max_tokens stop_reason -> max-tokens finish with the block closed', capped.at(-1)?.reason?.kind === 'max-tokens'
+    && capped.some((c) => c.type === 'block-end' && c.block?.text === 'long') && capped.some((c) => c.type === 'usage'), JSON.stringify(capped.map((c) => c.type)));
+  // In-stream error event: Anthropic nests the details under `error`.
+  const overloaded = await anthChunksOf(['event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n']);
+  check('anthropic-sse: error event -> SERVER finish with the nested message', overloaded.at(-1)?.reason?.kind === 'error' && overloaded.at(-1)?.reason?.failure?.code === 'SERVER'
+    && overloaded.at(-1)?.reason?.failure?.message === 'Overloaded', JSON.stringify(overloaded.at(-1)));
+  const bareErr = await anthChunksOf(['event: error\ndata: relay gave up\n\n']);
+  check('anthropic-sse: non-JSON error event keeps the raw text as the message', bareErr.at(-1)?.reason?.failure?.message === 'relay gave up', JSON.stringify(bareErr.at(-1)));
+  const dataErr = await anthChunksOf([`data: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } })}\n\n`]);
+  check('anthropic-sse: data-JSON error without an event name -> RATE_LIMIT finish', dataErr.at(-1)?.reason?.failure?.code === 'RATE_LIMIT', JSON.stringify(dataErr.at(-1)));
+}
+
+// 3d. Classification units: the mapping every wire path shares.
+{
+  // Retry-After: both RFC 9110 spellings, and an over-ceiling hint is DROPPED
+  // (the executor abandons a normal-mode retry when the provider delay exceeds
+  // the policy's maxDelayMs, so forwarding it would cost the retry entirely).
+  check('retry-after: delay-seconds parsed to ms', parseRetryAfterMs('2') === 2000, String(parseRetryAfterMs('2')));
+  check('retry-after: HTTP-date parsed against now', parseRetryAfterMs('Wed, 21 Oct 2026 07:28:03 GMT', Date.parse('Wed, 21 Oct 2026 07:28:00 GMT')) === 3000, String(parseRetryAfterMs('Wed, 21 Oct 2026 07:28:03 GMT', Date.parse('Wed, 21 Oct 2026 07:28:00 GMT'))));
+  check('retry-after: absent / blank / unparseable / non-positive -> undefined', parseRetryAfterMs(null) === undefined && parseRetryAfterMs('  ') === undefined && parseRetryAfterMs('soon') === undefined && parseRetryAfterMs('0') === undefined);
+  check('retry-after: hint above the host policy ceiling dropped (keeps the retry alive)', parseRetryAfterMs('600') === undefined, String(parseRetryAfterMs('600')));
+  check('retry-after: hint at the ceiling kept', parseRetryAfterMs('10') === 10000, String(parseRetryAfterMs('10')));
+
+  // HTTP status mapping: transient classes land in the retryable set,
+  // deterministic ones do not.
+  const cases = [
+    [429, 'slow down', 'RATE_LIMIT'],
+    [500, 'boom', 'SERVER'],
+    [502, 'bad gateway', 'SERVER'],
+    [503, 'overloaded', 'SERVER'],
+    [408, 'timeout', 'TIMEOUT'],
+    [401, 'invalid api key', 'AUTH'],
+    [403, 'forbidden', 'AUTH'],
+    [400, 'bad body', 'INVALID_REQUEST'],
+    [404, 'no such model', 'INVALID_REQUEST'],
+    [418, 'teapot', 'UPSTREAM_ERROR'],
+  ];
+  for (const [status, detail, want] of cases) {
+    check(`status ${status} -> ${want}`, classifyHttpStatus(status, detail).code === want, JSON.stringify(classifyHttpStatus(status, detail)));
+  }
+  // Body wording beats the status: a context overflow or an exhausted quota
+  // arrives under assorted statuses and must never be re-attempted.
+  check('status 400 + context-overflow wording -> CONTEXT_WINDOW_EXCEEDED', classifyHttpStatus(400, "This model's maximum context length is 128000 tokens").code === 'CONTEXT_WINDOW_EXCEEDED');
+  check('status 429 + exhausted-quota wording -> QUOTA', classifyHttpStatus(429, 'You exceeded your current quota, please check your plan and billing details').code === 'QUOTA');
+  check('status 429 carries the status + capped Retry-After facts', JSON.stringify(classifyHttpStatus(429, 'slow down', 2000)) === JSON.stringify({ code: 'RATE_LIMIT', status: 429, providerRetryAfterMs: 2000 }));
+
+  // Provider-native in-stream codes map onto DSH codes; an unknown one on an
+  // already-accepted stream defaults to SERVER (a relay failure mid-stream is
+  // transient far more often than deterministic).
+  check('provider code overloaded_error -> SERVER', classifyProviderError('overloaded_error', 'Overloaded').code === 'SERVER');
+  check('provider code rate_limit_exceeded -> RATE_LIMIT', classifyProviderError('rate_limit_exceeded', '').code === 'RATE_LIMIT');
+  check('provider code insufficient_quota -> QUOTA', classifyProviderError('insufficient_quota', 'quota exceeded').code === 'QUOTA');
+  check('provider code invalid_api_key -> AUTH', classifyProviderError('invalid_api_key', '').code === 'AUTH');
+  check('provider code is case-insensitive', classifyProviderError('SERVER_ERROR', '').code === 'SERVER');
+  check('unknown provider code -> SERVER (in-stream relay failure)', classifyProviderError('weird_gateway_code', 'it broke').code === 'SERVER');
+  check('unknown provider code with transient wording follows the wording', classifyProviderError('weird', 'connection reset by peer').code === 'TRANSPORT');
+
+  // Wording-only fallbacks (transport messages have no status).
+  check('wording: connect ECONNREFUSED -> TRANSPORT', classifyErrorText('fetch failed: connect ECONNREFUSED 127.0.0.1:443')?.code === 'TRANSPORT');
+  check('wording: headers timeout -> TIMEOUT', classifyErrorText('fetch failed: HeadersTimeoutError: headers timeout received')?.code === 'TIMEOUT');
+  check('wording: dns failure -> TRANSPORT', classifyErrorText('fetch failed: getaddrinfo ENOTFOUND gw.example.com')?.code === 'TRANSPORT');
+  check('wording: unclassifiable -> undefined (caller applies its own default)', classifyErrorText('something odd happened') === undefined);
+
+  // Stream-end classification.
+  check('stream end: terminal + content -> no failure', classifyStreamEnd(true, true) === undefined);
+  check('stream end: terminal + no content -> EMPTY_RESPONSE', classifyStreamEnd(true, false)?.code === 'EMPTY_RESPONSE');
+  check('stream end: no terminal + content -> TRANSPORT', classifyStreamEnd(false, true)?.code === 'TRANSPORT');
+  check('stream end: no terminal + no content -> EMPTY_RESPONSE', classifyStreamEnd(false, false)?.code === 'EMPTY_RESPONSE');
+
+  // Thrown values: cause chain rendered, credential-bearing URLs redacted.
+  const chained = classifyTransportError(new TypeError('fetch failed', { cause: Object.assign(new Error('connect ETIMEDOUT 10.0.0.1:443'), { code: 'ETIMEDOUT' }) }));
+  check('transport: chained cause rendered + timeout classified', chained.code === 'TIMEOUT' && /ETIMEDOUT/.test(chained.message), JSON.stringify(chained));
+  const leaky = classifyTransportError(new TypeError('Request cannot be constructed from a URL that includes credentials: https://user:sekret@gw.example.com/v1/messages'));
+  check('transport: URL credentials redacted out of the rendered message', !leaky.message.includes('sekret') && leaky.message.includes('***:***@'), JSON.stringify(leaky));
+}
 
 if (failures > 0) process.exit(1);
 
@@ -354,18 +553,20 @@ const sseOf = (obj) => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
 // 5f. failed / error events
 {
   const failed = await responsesChunksOf([sseOf({ type: 'response.output_text.delta', delta: 'par' }), sseOf({ type: 'response.failed', response: { error: { code: 'server_error', message: 'boom upstream' } } })]);
-  check('responses-sse: response.failed -> error finish (message from response.error)', failed.at(-1)?.reason?.kind === 'error' && failed.at(-1)?.reason?.failure?.message === 'boom upstream' && failed.at(-1)?.reason?.failure?.code === 'server_error', JSON.stringify(failed.at(-1)));
+  check('responses-sse: response.failed -> SERVER error finish (native code kept in the message)', failed.at(-1)?.reason?.kind === 'error' && failed.at(-1)?.reason?.failure?.message === 'boom upstream (server_error)' && failed.at(-1)?.reason?.failure?.code === 'SERVER', JSON.stringify(failed.at(-1)));
   check('responses-sse: deltas before the failure are not discarded', failed.some((c) => c.type === 'text-delta' && c.text === 'par'), JSON.stringify(failed.map((c) => c.type)));
   const errored = await responsesChunksOf([sseOf({ type: 'response.error', code: 'rate_limit', message: 'slow down' })]);
-  check('responses-sse: response.error -> error finish', errored.at(-1)?.reason?.kind === 'error' && errored.at(-1)?.reason?.failure?.message === 'slow down', JSON.stringify(errored.at(-1)));
+  check('responses-sse: response.error -> RATE_LIMIT error finish', errored.at(-1)?.reason?.kind === 'error' && errored.at(-1)?.reason?.failure?.code === 'RATE_LIMIT' && errored.at(-1)?.reason?.failure?.message === 'slow down (rate_limit)', JSON.stringify(errored.at(-1)));
   const bare = await responsesChunksOf(['event: error\r\ndata: gateway exploded\r\n\r\n']);
   check('responses-sse: bare event:error framing -> error finish', bare.at(-1)?.reason?.kind === 'error' && /gateway exploded/.test(bare.at(-1)?.reason?.failure?.message ?? ''), JSON.stringify(bare.at(-1)));
 }
 
-// 5g. early stream end without a terminal event still closes + finishes
+// 5g. early stream end without a terminal event: the reply was CUT, so it is a
+// classified transport failure (retryable) rather than a `stop` that would
+// present a truncated answer as complete.
 {
   const chunks = await responsesChunksOf([sseOf({ type: 'response.output_text.delta', delta: 'cut' })]);
-  check('responses-sse: early stream end closes text + finish stop', chunks.some((c) => c.type === 'block-end' && c.block?.text === 'cut') && chunks.at(-1)?.reason?.kind === 'stop', JSON.stringify(chunks));
+  check('responses-sse: early stream end closes text + TRANSPORT error finish', chunks.some((c) => c.type === 'block-end' && c.block?.text === 'cut') && chunks.at(-1)?.reason?.kind === 'error' && chunks.at(-1)?.reason?.failure?.code === 'TRANSPORT', JSON.stringify(chunks));
 }
 
 // 5h. abort -> aborted finish (signal aborts, stream then errors like a torn fetch)

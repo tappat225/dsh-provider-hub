@@ -17,7 +17,7 @@ DSH（DeepSeek Harness）LLM **provider 中枢插件**：通过 DSH 左侧栏的
 | host | `src/index.ts` + `src/host/` | `lib/index.js`（node ESM） | DSH 宿主进程：Config schema（`gateways` 数组）、apply、凭据解析、LLM 路由注册、`ProviderHubRuntime`（typert Remote：配置读写/模型管理/发现） |
 | client | `src/client/` | `lib/client.js`（ModuleLoader CJS） | 渲染进程：Provider Hub 面板 UI（React 是宿主全局，卡片式控制台） |
 
-- `src/wire/` 是协议层：`anthropic-messages` / `openai-completions` / `openai-responses` 三协议的消息转换 + SSE→StreamChunk；`src/adapter.ts` 按 `options.provider` 选路派发。
+- `src/wire/` 是协议层：`anthropic-messages` / `openai-completions` / `openai-responses` 三协议的消息转换 + SSE→StreamChunk；`src/adapter.ts` 按 `options.provider` 选路派发。`src/wire/failure.ts` 是三协议与 HTTP 边界共用的**失败分类单一入口**：宿主的重试执行器只按 `failure.code` 决定是否重发，码不在可重试集合里就直接结束本轮（表现为要用户手动输「继续」），所以新增失败路径时必须给它一个分类码，不要直接用兜底的 `UPSTREAM_ERROR`。
 - `lib/` 是构建产物且入库（历史如此）：**绝不手改**，改 `src/` 后必须重建（见「开发与验证」）。
 - 与宿主交互的关键机制（settings 读写范式、client bundle 注册格式、remote `$mount` 范式等）的踩坑结论沉淀在 `note/memory/KEY.md`，动手前先读。
 
@@ -63,7 +63,7 @@ DSH（DeepSeek Harness）LLM **provider 中枢插件**：通过 DSH 左侧栏的
 │   ├── adapter.ts                # GatewayAdapter：三协议请求派发 + chunk 转换 + 凭据/请求头处理
 │   ├── discovery.ts              # 模型发现（带自定义 UA 拉 GET {baseURL}/models）
 │   ├── probe.ts                  # 连接测试第二段（/models 不通时经首选模型发 "hi" 实聊验证）
-│   ├── url.ts                    # endpoint 规范化（/v1 自动补齐，防 /v1/v1）
+│   ├── url.ts                    # endpoint 规范化（/v1 自动补齐，防 /v1/v1）+ 凭据 URL 遮蔽
 │   ├── host/
 │   │   ├── contract.ts           # typert wire 契约（INVOCATIONS / TYPERT_MANIFEST / METHODS 三处同步）
 │   │   └── runtime.ts            # ProviderHubRuntime（Remote：配置读写/模型管理/发现/连接测试）
@@ -75,7 +75,8 @@ DSH（DeepSeek Harness）LLM **provider 中枢插件**：通过 DSH 左侧栏的
 │   │   └── primitives.d.ts       # 宿主 UI 原语类型 shim
 │   ├── client-runtime.d.ts       # 宿主全局类型 shim
 │   └── wire/
-│       ├── sse.ts                # 通用 SSE 解析器
+│       ├── failure.ts            # 失败分类：HTTP 状态 / 传输抛错 / 上游原生码 / 流终局 → DSH 失败码（重试的唯一路由依据，见 README「失败分类与自动重试」）
+│       ├── sse.ts                # 通用 SSE 解析器 + 终局 chunk 构造
 │       ├── openai.ts             # openai-completions 消息转换 + chunk 转换
 │       ├── responses.ts          # openai-responses 路径
 │       └── anthropic.ts          # anthropic-messages 转换 + SSE -> StreamChunk

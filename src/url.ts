@@ -148,3 +148,17 @@ export function redactUrl(url: string): string {
     return url; // not a parseable URL — return as-is (it never reached the wire)
   }
 }
+
+/**
+ * Mask userinfo credentials in URLs quoted ANYWHERE inside a longer text — an
+ * error message that renders a failed dial, or one link of a chained cause.
+ * {@link redactUrl} handles a bare URL; this handles prose that repeats one
+ * verbatim (`fetch` and undici both echo the request URL into their messages),
+ * so a gateway configured with its key embedded in the URL cannot leak it into
+ * a failure surface.
+ */
+export function redactUrlsInText(text: string): string {
+  return text
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, '$1***:***@')
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+)@/gi, '$1***@');
+}

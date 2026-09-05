@@ -244,6 +244,24 @@ export interface OpenAIChatUsage {
   prompt_tokens_details?: { cached_tokens?: number };
 }
 
+/**
+ * In-stream provider error payload.
+ *
+ * A gateway that ACCEPTED the request (HTTP 200) and then failed while
+ * relaying reports it inside the SSE body instead of as an HTTP status:
+ * OpenAI-compatible chat streams carry a top-level `error` object on a chunk,
+ * Anthropic carries an `event: error` record whose data is
+ * `{ type, error: { type, message } }`. Both spellings are read through this
+ * shape (nested one level) and classified by `wire/failure.ts`.
+ */
+export interface ProviderErrorPayload {
+  message?: string;
+  type?: string;
+  code?: string | number | null;
+  /** Anthropic nests the details one level down under `error`. */
+  error?: ProviderErrorPayload;
+}
+
 export interface OpenAIChatChunk {
   choices?: Array<{
     index?: number;
@@ -251,4 +269,6 @@ export interface OpenAIChatChunk {
     finish_reason?: string | null;
   }>;
   usage?: OpenAIChatUsage;
+  /** Present on the chunk a gateway uses to report an in-stream failure. */
+  error?: ProviderErrorPayload;
 }

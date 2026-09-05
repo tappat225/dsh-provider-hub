@@ -234,6 +234,37 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: { message: `auth failed for ${req.headers['authorization']}` } }));
         return;
       }
+      if (req.headers['x-test-status']) {
+        // Deterministic upstream failure: the adapter must map the HTTP status
+        // onto the DSH failure code the host's retry executor routes on, and
+        // carry Retry-After through when the gateway sent one.
+        const status = Number(req.headers['x-test-status']);
+        const headers = { 'Content-Type': 'application/json' };
+        if (req.headers['x-test-retry-after']) headers['Retry-After'] = req.headers['x-test-retry-after'];
+        res.writeHead(status, headers);
+        res.end(JSON.stringify({ error: { message: `upstream boom ${status}`, type: 'server_error' } }));
+        return;
+      }
+      if (req.headers['x-test-truncate']) {
+        // A stream cut mid-flight: content delivered, then the body closes with
+        // no terminal marker — a half answer must never be reported as a
+        // completed `stop`. (res.destroy() would drop the buffered write and
+        // the delta would never reach the client.)
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ id: 'chatcmpl-3', object: 'chat.completion.chunk', created: 1, model: 't', choices: [{ index: 0, delta: { content: 'partial answer' }, finish_reason: null }] })}\n\n`);
+        res.end();
+        return;
+      }
+      if (req.headers['x-test-empty']) {
+        // Degenerate completion: the terminal marker arrives but no model
+        // output ever did — an empty assistant message would silently end the
+        // turn with nothing for the loop to act on.
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ id: 'chatcmpl-4', object: 'chat.completion.chunk', created: 1, model: 't', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
       if (req.headers['x-test-tools']) {
         // Streaming tool-call variant
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -970,9 +1001,77 @@ const echoAdapter = new (Object.getPrototypeOf(adapter).constructor)({
 const echoChunks = [];
 for await (const c of echoAdapter.stream({ provider: 'echo-key', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) echoChunks.push(c);
 const echoFailure = echoChunks.at(-1)?.reason?.failure;
-check('upstream error echoes are scrubbed of the API key', echoFailure?.code === 'UPSTREAM_ERROR'
+check('upstream error echoes are scrubbed of the API key', echoFailure?.code === 'AUTH'
+  && echoFailure?.status === 401
   && String(echoFailure?.message ?? '').includes('upstream 401')
   && !String(echoFailure?.message ?? '').includes('sk-ECHO-SECRET-123'), JSON.stringify(echoFailure ?? null));
+
+// 8c. Failure classification is the whole retry mechanism: the host's retry
+// executor re-issues a failed step ONLY when `failure.code` is a member of the
+// route policy's retryable set (default normal: EMPTY_RESPONSE, RATE_LIMIT,
+// SERVER, TIMEOUT, TRANSPORT). Every other code ends the turn, which is what
+// forces the user to nudge the conversation forward by hand. These cases pin
+// the classification at the adapter boundary (over the wire, not just at the
+// converter unit level) so a transient condition can never regress into a
+// code the executor delegates downstream.
+const classifyAdapterFor = (provider, extraHeaders, baseURL = 'http://127.0.0.1:18996') => {
+  const gw = plugin.Config({ gateways: [{
+    provider,
+    baseURL,
+    api: 'openai-completions',
+    userAgent: 'ua-classify',
+    apiKey: 'sk-classify',
+    extraHeaders,
+    enabledModels: ['glm-5.3'],
+  }] }).gateways[0];
+  return new (Object.getPrototypeOf(adapter).constructor)({
+    current: () => ({ gateways: [gw] }),
+    gatewayFor: (p) => gw.provider === p ? gw : undefined,
+    resolveApiKey: async () => 'sk-classify',
+    preset: () => undefined,
+  });
+};
+const classifyFailureOf = async (provider, extraHeaders, baseURL) => {
+  const chunks = [];
+  for await (const c of classifyAdapterFor(provider, extraHeaders, baseURL).stream({ provider, model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) chunks.push(c);
+  return chunks.at(-1)?.reason?.failure;
+};
+
+// 429 -> RATE_LIMIT, with the gateway's Retry-After forwarded as the delay hint
+// and the status preserved for diagnostics.
+const rateFailure = await classifyFailureOf('cls-429', { 'x-test-status': '429', 'x-test-retry-after': '3' });
+check('classify: 429 -> RATE_LIMIT + status + providerRetryAfterMs', rateFailure?.code === 'RATE_LIMIT'
+  && rateFailure?.status === 429 && rateFailure?.providerRetryAfterMs === 3000, JSON.stringify(rateFailure ?? null));
+
+// A Retry-After above the policy ceiling is DROPPED, not forwarded: in normal
+// mode the executor treats an over-ceiling hint as "give up" rather than "wait
+// longer", so forwarding it would cancel the retry outright.
+const hugeRetryAfter = await classifyFailureOf('cls-429-huge', { 'x-test-status': '429', 'x-test-retry-after': '600' });
+check('classify: over-ceiling Retry-After dropped (retry survives on local backoff)', hugeRetryAfter?.code === 'RATE_LIMIT'
+  && hugeRetryAfter?.providerRetryAfterMs === undefined, JSON.stringify(hugeRetryAfter ?? null));
+
+// 5xx -> SERVER; 401 -> AUTH (deterministic: the same request fails the same
+// way, so a retry only burns wall-clock time).
+const serverFailure = await classifyFailureOf('cls-500', { 'x-test-status': '503' });
+check('classify: 503 -> SERVER', serverFailure?.code === 'SERVER' && serverFailure?.status === 503, JSON.stringify(serverFailure ?? null));
+const authFailure = await classifyFailureOf('cls-401', { 'x-test-status': '401' });
+check('classify: 401 -> AUTH (not retryable)', authFailure?.code === 'AUTH' && authFailure?.status === 401, JSON.stringify(authFailure ?? null));
+
+// Nothing listening -> TRANSPORT (connection refused).
+const deadFailure = await classifyFailureOf('cls-dead', undefined, 'http://127.0.0.1:1');
+check('classify: refused connection -> TRANSPORT', deadFailure?.code === 'TRANSPORT', JSON.stringify(deadFailure ?? null));
+
+// A stream cut mid-flight -> TRANSPORT, and the partial text already delivered
+// is NOT discarded (the failure is appended after the emitted deltas).
+const truncChunks = [];
+for await (const c of classifyAdapterFor('cls-trunc', { 'x-test-truncate': '1' }).stream({ provider: 'cls-trunc', model: 'glm-5.3', maxTokens: 8, messages: [{ role: 'user', content: 'hi' }] })) truncChunks.push(c);
+check('classify: stream cut before its terminal marker -> TRANSPORT (not a silent stop)', truncChunks.at(-1)?.reason?.failure?.code === 'TRANSPORT', JSON.stringify(truncChunks.at(-1)?.reason ?? null));
+check('classify: cut stream keeps the deltas already delivered', truncChunks.some((c) => c.type === 'text-delta' && c.text === 'partial answer'), JSON.stringify(truncChunks.map((c) => c.type)));
+
+// Terminal marker but zero output -> EMPTY_RESPONSE (retryable: the attempt
+// produced nothing durable, and an empty assistant message ends the turn).
+const emptyFailure = await classifyFailureOf('cls-empty', { 'x-test-empty': '1' });
+check('classify: zero-output completion -> EMPTY_RESPONSE', emptyFailure?.code === 'EMPTY_RESPONSE', JSON.stringify(emptyFailure ?? null));
 
 // 10. Three-protocol + endpoint-mode coverage (offline echo server only).
 // 10a. openai-responses path: auto mode (bare host) dials /v1/responses with a
