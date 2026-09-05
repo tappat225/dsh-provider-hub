@@ -1,6 +1,6 @@
 {
   "id": "@tappat225/dsh-provider-hub",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "main": "lib/index.js",
   "description": "DSH LLM provider hub: register gateway routes with their own settings panel, built-in mainstream model catalog, three wire protocols (anthropic-messages, openai-completions, openai-responses), auto/custom endpoint addressing, custom User-Agent for UA-whitelisted gateways, model overrides and live model discovery.",
   "engines": {
